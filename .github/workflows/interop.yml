@@ -1,0 +1,87 @@
+# Runs the interop matrix: Go, Node and Python each produce a release; .NET, Go, Java, Node and Python
+# each read every release. Every release's key file is wrapped under a KEK on the runner itself, so the
+# whole matrix runs in one job on one host with the HkdfGuard native package installed and the test
+# service provisioned. GitHub's hosted runners have neither; this needs a self-hosted runner labelled
+# hkdfguard-interop (see the README). Add a schedule once one is registered.
+name: Interop
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag or SHA of every hkdfguard-* port to test
+        default: develop
+
+permissions:
+  contents: read
+
+concurrency:
+  group: interop-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PORTS_REF: ${{ inputs.ref || 'develop' }}
+  # Private port repositories need a token that can read them; the default token reads only this one.
+  PORTS_TOKEN: ${{ secrets.HKDFGUARD_PORTS_TOKEN || github.token }}
+
+jobs:
+  matrix:
+    runs-on: [self-hosted, hkdfguard-interop]
+    timeout-minutes: 30
+    steps:
+      # The drivers reference the ports as sibling folders, so everything is checked out side by side.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: hkdfguard-interop-tests
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: runsecure/hkdfguard-dotnet
+          ref: ${{ env.PORTS_REF }}
+          token: ${{ env.PORTS_TOKEN }}
+          path: hkdfguard-dotnet
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: runsecure/hkdfguard-go
+          ref: ${{ env.PORTS_REF }}
+          token: ${{ env.PORTS_TOKEN }}
+          path: hkdfguard-go
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: runsecure/hkdfguard-java
+          ref: ${{ env.PORTS_REF }}
+          token: ${{ env.PORTS_TOKEN }}
+          path: hkdfguard-java
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: runsecure/hkdfguard-node
+          ref: ${{ env.PORTS_REF }}
+          token: ${{ env.PORTS_TOKEN }}
+          path: hkdfguard-node
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: runsecure/hkdfguard-python
+          ref: ${{ env.PORTS_REF }}
+          token: ${{ env.PORTS_TOKEN }}
+          path: hkdfguard-python
+
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: 10.0.x
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: hkdfguard-interop-tests/drivers/go/go.mod
+          cache: false
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: temurin
+          java-version: 25
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 22
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+
+      - name: Run the matrix
+        working-directory: hkdfguard-interop-tests
+        env:
+          HKDFGUARD_TEST_SERVICE: ${{ vars.HKDFGUARD_TEST_SERVICE }}
+        run: uv run --no-project python scripts/run_matrix.py --repos "${{ github.workspace }}"

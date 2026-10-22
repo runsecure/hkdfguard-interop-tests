@@ -1,0 +1,23 @@
+# The Python driver for the HkdfGuard interop matrix. Not a package: `uv run --project drivers/python
+# python drivers/python/interop.py ...`. The develop matrix installs the sibling hkdfguard-python
+# checkout; drop [tool.uv.sources] to test the published distributions.
+[project]
+name = "hkdfguard-interop-python-driver"
+version = "0"
+requires-python = ">=3.12"
+dependencies = [
+    "hkdfguard-abstractions",
+    "hkdfguard-cryptoprovider-aesgcm256",
+    "hkdfguard-keywrapping-v1",
+    "hkdfguard-dataencryptionkey",
+]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+hkdfguard-diagnostics = { path = "../../../hkdfguard-python/packages/hkdfguard-diagnostics", editable = true }
+hkdfguard-abstractions = { path = "../../../hkdfguard-python/packages/hkdfguard-abstractions", editable = true }
+hkdfguard-cryptoprovider-aesgcm256 = { path = "../../../hkdfguard-python/packages/hkdfguard-cryptoprovider-aesgcm256", editable = true }
+hkdfguard-keywrapping-v1 = { path = "../../../hkdfguard-python/packages/hkdfguard-keywrapping-v1", editable = true }
+hkdfguard-dataencryptionkey = { path = "../../../hkdfguard-python/packages/hkdfguard-dataencryptionkey", editable = true }

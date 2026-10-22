@@ -1,0 +1,14 @@
+{
+  "name": "hkdfguard-interop-node-driver",
+  "version": "0.0.0",
+  "private": true,
+  "description": "The Node.js driver for the HkdfGuard interop matrix. The develop matrix links the sibling hkdfguard-node checkout (built first); swap the file: links for versions to test the published packages.",
+  "main": "interop.cjs",
+  "dependencies": {
+    "@runsecure/hkdfguard-abstractions": "file:../../../hkdfguard-node/packages/abstractions",
+    "@runsecure/hkdfguard-cryptoprovider-aesgcm256": "file:../../../hkdfguard-node/packages/cryptoprovider-aesgcm256",
+    "@runsecure/hkdfguard-dek": "file:../../../hkdfguard-node/packages/dek",
+    "@runsecure/hkdfguard-keywrapping-native-v1": "file:../../../hkdfguard-node/packages/keywrapping-native-v1"
+  },
+  "engines": { "node": ">=22" }
+}
