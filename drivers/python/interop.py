@@ -34,15 +34,18 @@ def produce(service: str, fixtures: dict[str, Any], directory: Path, cli: str) -
     try:
         values = {s["identifier"]: pipeline.encrypt(s["plaintext"], s["identifier"]) for s in fixtures["secrets"]}
 
-        # Test only: a hash of the DEK, so every consumer can prove it unwrapped this same key.
+        # Test only: a hash of the DEK, so every consumer can prove it unwrapped this same key. Never
+        # record anything derived from a DEK beside its key file in a real pipeline. Decoding also
+        # leaves the DEK in an immutable bytes object that can't be zeroed, as every base64 decode in
+        # CPython does; acceptable for a throwaway test key only.
         key_base64 = pipeline.get_key_as_base64()
-        decoded = base64.b64decode(key_base64)
-        raw[:] = decoded
+        raw[:] = base64.b64decode(key_base64)
         dek_sha256 = hashlib.sha256(raw).hexdigest()
 
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        # The protector's own read-only view goes to stdin as it is: no copy of the key is made here.
         wrap = subprocess.run([cli, "wrap", "-kf", str(directory / KEY_FILE), "-sn", service, "--dek-stdin"],
-                              input=bytes(key_base64), capture_output=True)
+                              input=key_base64, capture_output=True)
         if wrap.returncode != 0:
             output = (wrap.stdout + wrap.stderr).decode(errors="replace").strip()
             raise RuntimeError(f"hkdfguard wrap exited {wrap.returncode}: {output}")

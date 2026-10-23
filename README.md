@@ -24,6 +24,19 @@ You need the HkdfGuard native package installed and a provisioned test service. 
 provisioning script creates `com.hkdfguard.integration.test.221`, which is the default. Set
 `HKDFGUARD_TEST_SERVICE` or pass `--service` to use another.
 
+The matrix runs every role as one account: it wraps key files and then reads them back. The native
+library's default **production** security model refuses exactly that, by design: an application may
+not read a key file it could have written itself. So run the matrix on a development or CI host in
+the **developer** model:
+
+- **Windows:** `SecurityModel` = `1` under `HKLM\Software\Policies\HkdfGuard`. Each driver process
+  then logs event 1005 when it reads a key file, which is expected here.
+- **Linux:** `security_model = "developer"` in `/etc/hkdfguard/policy.toml`.
+
+Never switch a production host to the developer model to make these tests pass. Under the
+production model the matrix can only run as a deployer writing to a deployer-owned folder, which
+is a different test.
+
 Check out the ports as siblings of this repository. The drivers build against those checkouts:
 
 ```
@@ -69,8 +82,12 @@ Every secret in [fixtures/secrets.json](fixtures/secrets.json) is checked, 13 ch
 - A value moved under another key fails authentication.
 - A value with one bit of its GCM tag flipped fails authentication.
 - The key file, unwrapped directly through the native wrapper, gives the same DEK the producer
-  generated. The producer records a SHA-256 of its DEK in `release.json` for this check. That is
-  acceptable only because these are throwaway test keys.
+  generated. The producer records a SHA-256 of its DEK in `release.json` for this check.
+
+**Don't copy that last pattern into a real pipeline.** Nothing derived from a DEK belongs beside its
+key file: a hash lets anyone holding the file confirm a guessed or leaked key, and it tells an
+attacker which key a stolen copy belongs to. It's acceptable here only because each run's DEK is
+random, used once, and deleted with the releases folder.
 
 ## The driver contract
 
@@ -108,6 +125,13 @@ The drivers reference the sibling checkouts: Go `replace` directives, Node `file
 sources, .NET `ProjectReference`s, and the Java `1.0.0-SNAPSHOT` that `mvnw install` puts in the
 local repository. To test published packages instead, replace those references with version numbers.
 Each driver's manifest says where.
+
+Third-party dependencies are pinned by committed lockfiles: `drivers/go/go.sum`,
+`drivers/node/package-lock.json` and `drivers/python/uv.lock`. The matrix installs with `npm ci` and
+`uv sync --locked`, which fail rather than re-resolve when a lockfile no longer matches its manifest.
+When a port adds or changes a dependency, refresh the lockfile on purpose and review the diff:
+`npm install` in `drivers/node`, `uv lock --project drivers/python`, or `go mod tidy` in
+`drivers/go`.
 
 ## CI
 

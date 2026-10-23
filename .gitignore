@@ -1,9 +1,7 @@
 # Driver build output
 drivers/go/bin/
 drivers/node/node_modules/
-drivers/node/package-lock.json
 drivers/python/.venv/
-drivers/python/uv.lock
 drivers/dotnet/bin/
 drivers/dotnet/obj/
 drivers/dotnet/out/

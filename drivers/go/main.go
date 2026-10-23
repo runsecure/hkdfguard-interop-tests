@@ -123,7 +123,8 @@ func produce(service string, f fixtures, dir, cli string) error {
 		}
 	}
 
-	// Test only: a hash of the DEK, so every consumer can prove it unwrapped this same key.
+	// Test only: a hash of the DEK, so every consumer can prove it unwrapped this same key. Never
+	// record anything derived from a DEK beside its key file in a real pipeline.
 	raw := make([]byte, aesgcm256.KeySize)
 	defer hkdfguard.Wipe(raw)
 	if n, err := base64.StdEncoding.Decode(raw, pipeline.KeyBase64()); err != nil || n != aesgcm256.KeySize {

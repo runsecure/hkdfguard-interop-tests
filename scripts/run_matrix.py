@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -73,9 +74,11 @@ def build(repos: Path, drivers: set[str]) -> None:
             # A fresh checkout needs its workspace installed; an existing one is left as it is.
             *([] if (repos / "hkdfguard-node" / "node_modules").is_dir() else [([tool("npm"), "ci", "--no-audit", "--no-fund"], repos / "hkdfguard-node")]),
             ([tool("npm"), "run", "build"], repos / "hkdfguard-node"),
-            ([tool("npm"), "install", "--no-audit", "--no-fund"], DRIVERS / "node"),
+            # ci and --locked install exactly what the committed lockfiles pin, and fail if a lockfile
+            # no longer matches its manifest, rather than resolving dependencies afresh.
+            ([tool("npm"), "ci", "--no-audit", "--no-fund"], DRIVERS / "node"),
         ],
-        "python": [([tool("uv"), "sync", "--project", str(DRIVERS / "python")], ROOT)],
+        "python": [([tool("uv"), "sync", "--locked", "--project", str(DRIVERS / "python")], ROOT)],
         "dotnet": [([tool("dotnet"), "build", str(DRIVERS / "dotnet" / "HkdfGuard.Interop.csproj"), "-c", "Release",
                      "-o", str(DRIVERS / "dotnet" / "out"), "-nologo", "-v", "q"], ROOT)],
         "java": [
@@ -131,6 +134,14 @@ def consume(driver: str, service: str, directory: Path) -> Cell:
 def last_line(result: subprocess.CompletedProcess[str]) -> str:
     lines = [line for line in (result.stdout + result.stderr).splitlines() if line.startswith(("OK", "FAIL"))]
     return lines[-1] if lines else f"exit {result.returncode}"
+
+
+def fenced(text: str) -> str:
+    """`text` as a Markdown code block whose fence is longer than any backtick run inside it, so
+    driver output can't close the block early and have the rest rendered as Markdown."""
+    longest = max((len(run) for run in re.findall(r"`+", text)), default=0)
+    fence = "`" * max(3, longest + 1)
+    return f"{fence}\n{text}\n{fence}"
 
 
 def grid(producers: list[str], consumers: list[str], cells: dict[tuple[str, str], Cell]) -> str:
@@ -190,7 +201,7 @@ def main() -> int:
         print(f"\n{failure}")
     if summary := os.environ.get("GITHUB_STEP_SUMMARY"):
         with open(summary, "a", encoding="utf-8") as f:
-            f.write(f"## HkdfGuard interop ({sys.platform})\n\n{table}\n\n" + "\n\n".join(f"```\n{x}\n```" for x in failures) + "\n")
+            f.write(f"## HkdfGuard interop ({sys.platform})\n\n{table}\n\n" + "\n\n".join(fenced(x) for x in failures) + "\n")
     return 1 if failures else 0
 
 

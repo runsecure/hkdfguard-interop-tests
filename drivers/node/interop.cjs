@@ -34,7 +34,10 @@ function produce(service, fixtures, dir, cli) {
     const encoder = new TextEncoder();
     const values = Object.fromEntries(fixtures.secrets.map((s) => [s.identifier, pipeline.encrypt(encoder.encode(s.plaintext), s.identifier)]));
 
-    // Test only: a hash of the DEK, so every consumer can prove it unwrapped this same key.
+    // Test only: a hash of the DEK, so every consumer can prove it unwrapped this same key. Never
+    // record anything derived from a DEK beside its key file in a real pipeline. Node has no
+    // buffer-to-buffer base64 decode, so the key also passes through an immutable string that can't
+    // be zeroed; acceptable for a throwaway test key only. The tool itself gets the base64 buffer.
     const base64 = pipeline.keyBase64();
     const n = Buffer.from(Buffer.from(base64.buffer, base64.byteOffset, base64.byteLength).toString('latin1'), 'base64').copy(raw);
     if (n !== KEY_SIZE) throw new Error(`decoding the pipeline key: ${n} bytes`);
