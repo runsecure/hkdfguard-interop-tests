@@ -3,13 +3,23 @@
 # whole matrix runs in one job on one host with the HkdfGuard native package installed and the test
 # service provisioned. GitHub's hosted runners have neither; this needs a self-hosted runner labelled
 # hkdfguard-interop (see the README). Add a schedule once one is registered.
+#
+# This job builds and runs code from five other repositories at a caller-chosen ref, on a host that
+# holds a KEK. So the workflow treats that code as untrusted:
+# - the ref must be a branch or tag name, never a pull-request ref (refs/pull/N/head is where a fork's
+#   PR lands, and dispatching it would run the fork's build scripts here);
+# - the token that reads the port repositories is handed only to the checkout steps, and no checkout
+#   leaves it in .git/config for later steps to find;
+# - the job runs in the hkdfguard-interop environment, so its secrets exist only inside it and a
+#   required-reviewer rule on that environment gates every run.
+# Register the runner with --ephemeral and keep nothing else on that host (README, "CI").
 name: Interop
 
 on:
   workflow_dispatch:
     inputs:
       ref:
-        description: Branch, tag or SHA of every hkdfguard-* port to test
+        description: Branch or tag of every hkdfguard-* port to test (never a pull-request ref)
         default: develop
 
 permissions:
@@ -19,50 +29,77 @@ concurrency:
   group: interop-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  PORTS_REF: ${{ inputs.ref || 'develop' }}
-  # Private port repositories need a token that can read them; the default token reads only this one.
-  PORTS_TOKEN: ${{ secrets.HKDFGUARD_PORTS_TOKEN || github.token }}
-
 jobs:
   matrix:
     runs-on: [self-hosted, hkdfguard-interop]
+    environment: hkdfguard-interop
     timeout-minutes: 30
     steps:
+      # The input is read through an environment variable, never interpolated into the script, so
+      # its value can't change what the shell runs.
+      - name: Check the ref is a branch or tag name
+        shell: bash
+        env:
+          REF: ${{ inputs.ref }}
+        run: |
+          if [[ "$REF" == pull/* || "$REF" == */pull/* ]]; then
+            echo "::error::'$REF' is a pull-request ref; the matrix runs only branches and tags." >&2
+            exit 1
+          fi
+          # A commit SHA is refused too: a fork's pull-request commits are fetchable from the base
+          # repository by SHA, which would get around the rule above.
+          if [[ "$REF" =~ ^[0-9a-fA-F]{7,64}$ ]]; then
+            echo "::error::'$REF' is a commit SHA; name a branch or tag." >&2
+            exit 1
+          fi
+          if [[ ! "$REF" =~ ^(refs/(heads|tags)/)?[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$ || "$REF" == *..* ]]; then
+            echo "::error::'$REF' is not a branch or tag name." >&2
+            exit 1
+          fi
+
       # The drivers reference the ports as sibling folders, so everything is checked out side by side.
+      # Private port repositories need a token that can read them; the default token reads only this
+      # one. Each checkout gets it as an input and drops it afterwards (persist-credentials: false):
+      # nothing later in the job needs git credentials.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: hkdfguard-interop-tests
+          persist-credentials: false
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: runsecure/hkdfguard-dotnet
-          ref: ${{ env.PORTS_REF }}
-          token: ${{ env.PORTS_TOKEN }}
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.HKDFGUARD_PORTS_TOKEN || github.token }}
           path: hkdfguard-dotnet
+          persist-credentials: false
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: runsecure/hkdfguard-go
-          ref: ${{ env.PORTS_REF }}
-          token: ${{ env.PORTS_TOKEN }}
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.HKDFGUARD_PORTS_TOKEN || github.token }}
           path: hkdfguard-go
+          persist-credentials: false
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: runsecure/hkdfguard-java
-          ref: ${{ env.PORTS_REF }}
-          token: ${{ env.PORTS_TOKEN }}
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.HKDFGUARD_PORTS_TOKEN || github.token }}
           path: hkdfguard-java
+          persist-credentials: false
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: runsecure/hkdfguard-node
-          ref: ${{ env.PORTS_REF }}
-          token: ${{ env.PORTS_TOKEN }}
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.HKDFGUARD_PORTS_TOKEN || github.token }}
           path: hkdfguard-node
+          persist-credentials: false
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: runsecure/hkdfguard-python
-          ref: ${{ env.PORTS_REF }}
-          token: ${{ env.PORTS_TOKEN }}
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.HKDFGUARD_PORTS_TOKEN || github.token }}
           path: hkdfguard-python
+          persist-credentials: false
 
       - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
         with:
@@ -81,7 +118,8 @@ jobs:
       - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
 
       - name: Run the matrix
+        shell: bash
         working-directory: hkdfguard-interop-tests
         env:
           HKDFGUARD_TEST_SERVICE: ${{ vars.HKDFGUARD_TEST_SERVICE }}
-        run: uv run --no-project python scripts/run_matrix.py --repos "${{ github.workspace }}"
+        run: uv run --no-project python scripts/run_matrix.py --repos "$GITHUB_WORKSPACE"

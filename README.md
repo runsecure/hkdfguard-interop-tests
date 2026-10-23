@@ -114,6 +114,26 @@ Each driver's manifest says where.
 [.github/workflows/interop.yml](.github/workflows/interop.yml) checks out every port side by side at
 one ref (default `develop`) and runs the matrix. Key files only open on the host that wrapped them,
 so the whole matrix runs in one job. That job needs a self-hosted runner labelled `hkdfguard-interop`
-with the native package installed and the test service provisioned. If the port repositories are
-private, also add a `HKDFGUARD_PORTS_TOKEN` secret that can read them. The workflow is
-manual-dispatch only until such a runner exists.
+with the native package installed and the test service provisioned. The workflow is manual-dispatch
+only until such a runner exists.
+
+The job builds and runs five other repositories' code, at a ref the caller chooses, on a host that
+holds a KEK. Set it up so that code is never trusted more than it has to be:
+
+- **Register the runner with `--ephemeral`**, so each job gets a fresh runner and nothing a build
+  leaves behind (`~/.m2`, caches, a modified toolchain) reaches the next one. Give the host no other
+  job and no other service's KEK: the test KEK is the only one it should ever hold.
+- **Create the `hkdfguard-interop` environment** in this repository's settings with a
+  required-reviewers rule. The job runs inside it, so every dispatch waits for a reviewer, and the
+  secrets below exist only for that job.
+- **If the port repositories are private**, add `HKDFGUARD_PORTS_TOKEN` to that environment: a
+  fine-grained token with read-only *Contents* on the five port repositories and nothing else. The
+  workflow hands it to the checkout steps only and no checkout keeps it in `.git/config`, so the
+  ports' build scripts never see it. Public ports need no token.
+- **Optionally set the `HKDFGUARD_TEST_SERVICE` variable** if the runner's test KEK is not
+  `com.hkdfguard.integration.test.221`.
+
+The `ref` input must be a branch or tag name. The workflow refuses pull-request refs
+(`refs/pull/N/head` is where a fork's PR lands in the base repository) and bare commit SHAs (a
+fork's PR commits are fetchable by SHA), because either would run a contributor's build scripts on
+the KEK host. To test a contributor's change, merge it to a branch first.
