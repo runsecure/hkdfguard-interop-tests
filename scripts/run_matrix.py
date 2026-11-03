@@ -1,21 +1,26 @@
 #!/usr/bin/env python3
 """Runs the HkdfGuard interop matrix on this host: builds every driver, has each producer write a
-release (pipeline-encrypted secrets plus a key file wrapped by the native hkdfguard tool), then has
-every consumer read every release. Prints a producer x consumer grid and exits non-zero if any cell
+release (pipeline-encrypted secrets plus a key file wrapped by one key wrapper), then has every
+consumer read every release with its own port of the same wrapper. Each consumer also reads each
+configured remote secret store through its own port of that store's cache. Prints a producer x
+consumer grid per wrapper, a store x consumer grid for the caches, and exits non-zero if any cell
 fails.
 
 Standard library only, so it runs before any driver's dependencies are installed:
 
-    python scripts/run_matrix.py                 # build, then run everything
+    python scripts/run_matrix.py                 # build, then run every configured wrapper and cache
     python scripts/run_matrix.py --skip-build    # reuse the last build
     python scripts/run_matrix.py --producers go --consumers dotnet,java
+    python scripts/run_matrix.py --wrappers awskms,googlekms --settings ../hkdfguard-dotnet/aws.runsettings
 
-The service's KEK must already be provisioned on this host (see the README).
+The native wrapper needs the service's KEK provisioned on this host; the network wrappers and caches
+need the HKDFGUARD_TEST_* settings each port's own integration tests read (see the README).
 """
 
 from __future__ import annotations
 
 import argparse
+import ctypes
 import os
 import re
 import shutil
@@ -23,6 +28,8 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
+import xml.etree.ElementTree as ElementTree
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -30,9 +37,28 @@ ROOT = Path(__file__).resolve().parent.parent
 DRIVERS = ROOT / "drivers"
 FIXTURES = ROOT / "fixtures" / "secrets.json"
 DEFAULT_SERVICE = "com.hkdfguard.integration.test.221"  # the test KEK every port's provisioning script creates
-PRODUCERS = ["go", "node", "python"]
+PRODUCERS = ["dotnet", "go", "java", "node", "python"]
 CONSUMERS = ["dotnet", "go", "java", "node", "python"]
 WINDOWS = sys.platform == "win32"
+
+# Each key wrapper, and the settings without which it can't run. The native wrapper needs only the
+# KEK on this host. The network wrappers read the same variables as each port's integration tests.
+WRAPPERS: dict[str, list[str]] = {
+    "native": [],
+    "awskms": ["HKDFGUARD_TEST_AWS_KMS_KEY_ID"],
+    "azurekeyvault": ["HKDFGUARD_TEST_AZURE_WRAP_KEY_ID", "HKDFGUARD_TEST_AZURE_SIGN_KEY_ID"],
+    "googlekms": ["HKDFGUARD_TEST_GOOGLE_KMS_KEY_NAME"],
+    "hashicorpvault": ["HKDFGUARD_TEST_VAULT_TRANSIT_KEY", "HKDFGUARD_TEST_VAULT_TOKEN"],
+}
+
+# Each remote secret cache, and its settings. The expected JSON is required: a cache read is only
+# checked against what the store is known to hold, never just for being non-empty.
+CACHES: dict[str, list[str]] = {
+    "awssecretsmanager": ["HKDFGUARD_TEST_AWS_SECRET_NAME", "HKDFGUARD_TEST_AWS_SECRET_JSON"],
+    "azurekeyvault": ["HKDFGUARD_TEST_AZURE_SECRET_ID", "HKDFGUARD_TEST_AZURE_SECRET_JSON"],
+    "googlesecretmanager": ["HKDFGUARD_TEST_GOOGLE_SECRET_NAME", "HKDFGUARD_TEST_GOOGLE_SECRET_JSON"],
+    "hashicorpvault": ["HKDFGUARD_TEST_VAULT_SECRET_NAME", "HKDFGUARD_TEST_VAULT_SECRET_JSON", "HKDFGUARD_TEST_VAULT_TOKEN"],
+}
 
 
 @dataclass
@@ -61,8 +87,26 @@ def default_cli() -> str:
     return shutil.which("hkdfguard") or "/usr/bin/hkdfguard"
 
 
-def run(command: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(command, cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+def read_settings(path: Path) -> dict[str, str]:
+    """The HKDFGUARD_TEST_* (and AWS_PROFILE/AWS_REGION) settings in a .NET runsettings file or a
+    NAME=value properties file - the files each port's integration tests already read - so the
+    matrix reuses them rather than asking for the same values again."""
+    text = path.read_text(encoding="utf-8-sig")
+    if text.lstrip().startswith("<"):
+        variables = ElementTree.fromstring(text).find("./RunConfiguration/EnvironmentVariables")
+        found = {e.tag: (e.text or "").strip() for e in (variables if variables is not None else [])}
+    else:
+        found = {}
+        for line in text.splitlines():
+            line = line.strip()
+            if line and not line.startswith(("#", "!")) and "=" in line:
+                name, value = line.split("=", 1)
+                found[name.strip()] = value.strip()
+    return {k: v for k, v in found.items() if v and re.fullmatch(r"HKDFGUARD_TEST_\w+|AWS_PROFILE|AWS_REGION", k)}
+
+
+def run(command: list[str], cwd: Path | None = None, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(command, cwd=cwd, env=env, capture_output=True, text=True, encoding="utf-8", errors="replace")
 
 
 def build(repos: Path, drivers: set[str]) -> None:
@@ -79,8 +123,11 @@ def build(repos: Path, drivers: set[str]) -> None:
             ([tool("npm"), "ci", "--no-audit", "--no-fund"], DRIVERS / "node"),
         ],
         "python": [([tool("uv"), "sync", "--locked", "--project", str(DRIVERS / "python")], ROOT)],
-        "dotnet": [([tool("dotnet"), "build", str(DRIVERS / "dotnet" / "HkdfGuard.Interop.csproj"), "-c", "Release",
-                     "-o", str(DRIVERS / "dotnet" / "out"), "-nologo", "-v", "q"], ROOT)],
+        "dotnet": [
+            ([tool("dotnet"), "restore", str(DRIVERS / "dotnet" / "HkdfGuard.Interop.csproj"), "--locked-mode", "-v", "q"], ROOT),
+            ([tool("dotnet"), "build", str(DRIVERS / "dotnet" / "HkdfGuard.Interop.csproj"), "--no-restore", "-c", "Release",
+              "-o", str(DRIVERS / "dotnet" / "out"), "-nologo", "-v", "q"], ROOT),
+        ],
         "java": [
             ([str(mvnw), "-q", "-B", "install", "-DskipTests"], repos / "hkdfguard-java"),
             ([str(mvnw), "-q", "-B", "-f", str(DRIVERS / "java" / "pom.xml"), "package"], ROOT),
@@ -107,13 +154,30 @@ def command_for(driver: str) -> list[str]:
     }[driver]
 
 
-def work_directory() -> Path:
-    """A fresh folder the native library will accept key files from.
+def long_path(path: str) -> str:
+    """`path` with any 8.3 short name expanded: %TEMP% can be one (C:\\Users\\RUNNER~1\\...), and
+    the native library refuses a key file whose path holds one."""
+    size = ctypes.windll.kernel32.GetLongPathNameW(path, None, 0)
+    if size == 0:
+        return path
+    buffer = ctypes.create_unicode_buffer(size)
+    ctypes.windll.kernel32.GetLongPathNameW(path, buffer, size)
+    return buffer.value
 
-    Windows refuses an 8.3 short name anywhere in a key file's path, and %TEMP% can be one, so the
-    path is expanded. Linux refuses a key file under any group- or world-writable directory, sticky
-    or not, so never /tmp: a private folder under $XDG_RUNTIME_DIR or ~/.cache instead.
+
+def work_directory() -> Path:
+    """A fresh folder every wrapper will accept key files from.
+
+    Windows: under the temp folder by its long path, made with a plain mkdir so it inherits the
+    temp folder's ACL. tempfile.mkdtemp's 0o700 gives it a protected DACL with an OWNER RIGHTS entry,
+    which the network wrappers' key file check refuses. Linux refuses a key file under any group- or
+    world-writable directory, sticky or not, so never /tmp: a private folder under $XDG_RUNTIME_DIR
+    or ~/.cache instead.
     """
+    if WINDOWS:
+        directory = Path(long_path(os.path.realpath(tempfile.gettempdir()))) / f"hkdfguard-interop-{uuid.uuid4().hex}"
+        directory.mkdir()
+        return directory
     if sys.platform.startswith("linux"):
         base = Path(os.environ.get("XDG_RUNTIME_DIR") or Path.home() / ".cache" / "hkdfguard-interop")
         base.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -121,13 +185,16 @@ def work_directory() -> Path:
     return Path(os.path.realpath(tempfile.mkdtemp(prefix="hkdfguard-interop-")))
 
 
-def produce(driver: str, service: str, cli: str, directory: Path) -> Cell:
-    result = run(command_for(driver) + ["produce", "--service", service, "--fixtures", str(FIXTURES), "--dir", str(directory), "--cli", cli])
-    return Cell(result.returncode == 0, last_line(result), result.stdout + result.stderr)
+def release_directory(work: Path, wrapper: str, producer: str) -> Path:
+    """The folder one producer writes one wrapper's release to, made here so every producer gets
+    the same permissions (see work_directory)."""
+    directory = work / wrapper / producer
+    directory.mkdir(parents=True, **({} if WINDOWS else {"mode": 0o700}))
+    return directory
 
 
-def consume(driver: str, service: str, directory: Path) -> Cell:
-    result = run(command_for(driver) + ["consume", "--service", service, "--fixtures", str(FIXTURES), "--dir", str(directory)])
+def invoke(driver: str, arguments: list[str], env: dict[str, str]) -> Cell:
+    result = run(command_for(driver) + arguments, env=env)
     return Cell(result.returncode == 0, last_line(result), result.stdout + result.stderr)
 
 
@@ -144,12 +211,35 @@ def fenced(text: str) -> str:
     return f"{fence}\n{text}\n{fence}"
 
 
-def grid(producers: list[str], consumers: list[str], cells: dict[tuple[str, str], Cell]) -> str:
-    header = "| producer \\ consumer | " + " | ".join(consumers) + " |"
+def grid(corner: str, rows: list[str], consumers: list[str], cells: dict[tuple[str, str], Cell]) -> str:
+    header = f"| {corner} | " + " | ".join(consumers) + " |"
     rule = "| --- |" + " :---: |" * len(consumers)
-    rows = ["| " + p + " | " + " | ".join(("pass" if cells[p, c].ok else "**FAIL**") if (p, c) in cells else "-" for c in consumers) + " |"
-            for p in producers]
-    return "\n".join([header, rule, *rows])
+    lines = ["| " + r + " | " + " | ".join(("pass" if cells[r, c].ok else "**FAIL**") if (r, c) in cells else "-" for c in consumers) + " |"
+             for r in rows]
+    return "\n".join([header, rule, *lines])
+
+
+def selected(requested: str | None, known: dict[str, list[str]], env: dict[str, str], what: str,
+             parser: argparse.ArgumentParser) -> tuple[list[str], list[str]]:
+    """The wrappers or caches to run, and a note for each configured-out one. Named explicitly, a
+    missing setting is an error; by default, an unconfigured one is skipped and said so, never
+    reported as passed."""
+    if requested is not None:
+        names = [n for n in requested.split(",") if n]
+        unknown = set(names) - set(known)
+        if unknown:
+            parser.error(f"unknown {what}(s): {', '.join(sorted(unknown))}")
+        for name in names:
+            if missing := [v for v in known[name] if not env.get(v)]:
+                parser.error(f"{what} {name} needs {', '.join(missing)}: set them, or pass --settings")
+        return names, []
+    names, skipped = [], []
+    for name, variables in known.items():
+        if missing := [v for v in variables if not env.get(v)]:
+            skipped.append(f"skip {what} {name}: {', '.join(missing)} not set")
+        else:
+            names.append(name)
+    return names, skipped
 
 
 def main() -> int:
@@ -159,6 +249,10 @@ def main() -> int:
     parser.add_argument("--repos", type=Path, default=ROOT.parent, help="the folder holding the sibling hkdfguard-* checkouts")
     parser.add_argument("--producers", default=",".join(PRODUCERS))
     parser.add_argument("--consumers", default=",".join(CONSUMERS))
+    parser.add_argument("--wrappers", help=f"key wrappers to run (default: every configured one of {', '.join(WRAPPERS)})")
+    parser.add_argument("--caches", help=f"remote caches to run (default: every configured one of {', '.join(CACHES)}); '' for none")
+    parser.add_argument("--settings", type=Path, action="append", default=[],
+                        help="a .runsettings or .test.properties file of HKDFGUARD_TEST_* settings; repeatable. The environment wins")
     parser.add_argument("--skip-build", action="store_true")
     parser.add_argument("--keep", action="store_true", help="keep the releases folder for inspection")
     args = parser.parse_args()
@@ -168,40 +262,79 @@ def main() -> int:
     unknown = (set(producers) - set(PRODUCERS)) | (set(consumers) - set(CONSUMERS))
     if unknown:
         parser.error(f"unknown driver(s): {', '.join(sorted(unknown))}")
-    if not Path(args.cli).is_file():
-        parser.error(f"the native hkdfguard tool is not at {args.cli}; pass --cli or set HKDFGUARD_CLI")
+
+    # Settings go to the drivers' environment only; their values are never printed.
+    env = dict(os.environ)
+    for path in args.settings:
+        for name, value in read_settings(path).items():
+            env.setdefault(name, value)
+    wrappers, skipped = selected(args.wrappers, WRAPPERS, env, "wrapper", parser)
+    caches, skipped_caches = selected(args.caches, CACHES, env, "cache", parser)
+    if "native" in wrappers and not Path(args.cli).is_file():
+        parser.error(f"the native hkdfguard tool is not at {args.cli}; pass --cli or set HKDFGUARD_CLI, or leave native out of --wrappers")
+    if not wrappers:
+        parser.error("no key wrapper to run")
+    for note in skipped + skipped_caches:
+        print(note, flush=True)
 
     if not args.skip_build:
         build(args.repos.resolve(), set(producers) | set(consumers))
 
     work = work_directory()
     print(f"service {args.service}, releases in {work}", flush=True)
-    cells: dict[tuple[str, str], Cell] = {}
+    cells: dict[str, dict[tuple[str, str], Cell]] = {w: {} for w in wrappers}
+    cache_cells: dict[tuple[str, str], Cell] = {}
     failures: list[str] = []
+    readable: dict[str, Path] = {}  # per consumer, a release it read, to build its cache's key ring over
     started = time.monotonic()
     try:
-        for p in producers:
-            made = produce(p, args.service, args.cli, work / p)
-            print(f"produce {p}: {made.summary}", flush=True)
-            if not made.ok:
-                failures.append(f"### produce {p}\n{made.output}")
-                continue
+        for w in wrappers:
+            for p in producers:
+                directory = release_directory(work, w, p)
+                made = invoke(p, ["produce", "--wrapper", w, "--service", args.service, "--fixtures", str(FIXTURES),
+                                  "--dir", str(directory), "--cli", args.cli], env)
+                print(f"produce {w} {p}: {made.summary}", flush=True)
+                if not made.ok:
+                    failures.append(f"### produce {w} {p}\n{made.output}")
+                    continue
+                for c in consumers:
+                    cell = cells[w][p, c] = invoke(c, ["consume", "--wrapper", w, "--service", args.service,
+                                                        "--fixtures", str(FIXTURES), "--dir", str(directory)], env)
+                    print(f"  {c} <- {w} {p}: {cell.summary}", flush=True)
+                    if cell.ok:
+                        readable.setdefault(c, directory)
+                    else:
+                        failures.append(f"### {c} reading the {w} {p} release\n{cell.output}")
+
+        for s in caches:
             for c in consumers:
-                cells[p, c] = consume(c, args.service, work / p)
-                print(f"  {c} <- {p}: {cells[p, c].summary}", flush=True)
-                if not cells[p, c].ok:
-                    failures.append(f"### {c} reading the {p} release\n{cells[p, c].output}")
+                if c not in readable:
+                    failures.append(f"### {c} reading {s}\nno release {c} could read to build a key ring over")
+                    continue
+                directory = readable[c]
+                cell = cache_cells[s, c] = invoke(c, ["cache", "--store", s, "--wrapper", directory.parent.name, "--service",
+                                                      args.service, "--fixtures", str(FIXTURES), "--dir", str(directory)], env)
+                print(f"cache {s} {c}: {cell.summary}", flush=True)
+                if not cell.ok:
+                    failures.append(f"### {c} reading {s}\n{cell.output}")
     finally:
         if not args.keep:
             shutil.rmtree(work, ignore_errors=True)
 
-    table = grid(producers, consumers, cells)
-    print(f"\n{table}\n\n{len(cells)} cells in {time.monotonic() - started:.0f}s")
+    tables = [f"#### {w}\n\n" + grid("producer \\ consumer", producers, consumers, cells[w]) for w in wrappers]
+    if caches:
+        tables.append("#### remote caches\n\n" + grid("store \\ consumer", caches, consumers, cache_cells))
+    report = "\n\n".join(tables)
+    count = sum(len(c) for c in cells.values()) + len(cache_cells)
+    print(f"\n{report}\n\n{count} cells in {time.monotonic() - started:.0f}s")
+    for note in skipped + skipped_caches:
+        print(note)
     for failure in failures:
         print(f"\n{failure}")
     if summary := os.environ.get("GITHUB_STEP_SUMMARY"):
         with open(summary, "a", encoding="utf-8") as f:
-            f.write(f"## HkdfGuard interop ({sys.platform})\n\n{table}\n\n" + "\n\n".join(fenced(x) for x in failures) + "\n")
+            f.write(f"## HkdfGuard interop ({sys.platform})\n\n{report}\n\n" + "\n".join(skipped + skipped_caches) + "\n\n"
+                    + "\n\n".join(fenced(x) for x in failures) + "\n")
     return 1 if failures else 0
 
 

@@ -5,10 +5,27 @@
   "description": "The Node.js driver for the HkdfGuard interop matrix. The develop matrix links the sibling hkdfguard-node checkout (built first); swap the file: links for versions to test the published packages.",
   "main": "interop.cjs",
   "dependencies": {
+    "@aws-sdk/client-kms": "3.1149.0",
+    "@aws-sdk/client-secrets-manager": "3.1149.0",
+    "@azure/identity": "4.13.3",
+    "@google-cloud/kms": "6.3.0",
+    "@google-cloud/secret-manager": "7.1.1",
     "@runsecure/hkdfguard-abstractions": "file:../../../hkdfguard-node/packages/abstractions",
+    "@runsecure/hkdfguard-cache": "file:../../../hkdfguard-node/packages/cache",
+    "@runsecure/hkdfguard-cache-awssecretsmanager": "file:../../../hkdfguard-node/packages/cache-awssecretsmanager",
+    "@runsecure/hkdfguard-cache-azurekeyvault": "file:../../../hkdfguard-node/packages/cache-azurekeyvault",
+    "@runsecure/hkdfguard-cache-googlesecretmanager": "file:../../../hkdfguard-node/packages/cache-googlesecretmanager",
+    "@runsecure/hkdfguard-cache-hashicorpvault": "file:../../../hkdfguard-node/packages/cache-hashicorpvault",
     "@runsecure/hkdfguard-cryptoprovider-aesgcm256": "file:../../../hkdfguard-node/packages/cryptoprovider-aesgcm256",
     "@runsecure/hkdfguard-dek": "file:../../../hkdfguard-node/packages/dek",
-    "@runsecure/hkdfguard-keywrapping-native-v1": "file:../../../hkdfguard-node/packages/keywrapping-native-v1"
+    "@runsecure/hkdfguard-diagnostics": "file:../../../hkdfguard-node/packages/diagnostics",
+    "@runsecure/hkdfguard-integration-hashicorpvault": "file:../../../hkdfguard-node/packages/integration-hashicorpvault",
+    "@runsecure/hkdfguard-keywrapping-awskms": "file:../../../hkdfguard-node/packages/keywrapping-awskms",
+    "@runsecure/hkdfguard-keywrapping-azurekeyvault": "file:../../../hkdfguard-node/packages/keywrapping-azurekeyvault",
+    "@runsecure/hkdfguard-keywrapping-googlekms": "file:../../../hkdfguard-node/packages/keywrapping-googlekms",
+    "@runsecure/hkdfguard-keywrapping-hashicorpvault": "file:../../../hkdfguard-node/packages/keywrapping-hashicorpvault",
+    "@runsecure/hkdfguard-keywrapping-native-v1": "file:../../../hkdfguard-node/packages/keywrapping-native-v1",
+    "@runsecure/hkdfguard-securefile": "file:../../../hkdfguard-node/packages/securefile"
   },
   "engines": { "node": ">=22" }
 }

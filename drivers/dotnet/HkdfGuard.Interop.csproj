@@ -1,7 +1,8 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <!-- The .NET driver for the HkdfGuard interop matrix. The develop matrix references the sibling
-       hkdfguard-dotnet checkout; swap these for PackageReferences to test the published packages. -->
+       hkdfguard-dotnet checkout; swap these ProjectReferences for PackageReferences to test the
+       published packages. -->
   <PropertyGroup>
     <OutputType>Exe</OutputType>
     <TargetFramework>net10.0</TargetFramework>
@@ -10,11 +11,39 @@
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
   </PropertyGroup>
 
+  <!-- The driver is outside hkdfguard-dotnet's central package management, so its own package
+       references carry their versions here, pinned to the ones Directory.Packages.props pins there.
+       packages.lock.json records the driver's whole resolved graph, the port's packages included;
+       on CI restore must match it exactly, as the port's own projects must match theirs. Refresh it
+       deliberately when the port changes a dependency: dotnet restore force-evaluate on this project. -->
+  <PropertyGroup>
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(CI)' == 'true' Or '$(TF_BUILD)' == 'true' Or '$(GITHUB_ACTIONS)' == 'true'">
+    <RestoreLockedMode>true</RestoreLockedMode>
+  </PropertyGroup>
+
   <ItemGroup>
     <ProjectReference Include="..\..\..\hkdfguard-dotnet\src\HkdfGuard.Abstractions\HkdfGuard.Abstractions.csproj" />
     <ProjectReference Include="..\..\..\hkdfguard-dotnet\src\HkdfGuard.CryptoProvider.AesGcm256\HkdfGuard.CryptoProvider.AesGcm256.csproj" />
     <ProjectReference Include="..\..\..\hkdfguard-dotnet\src\HkdfGuard.DataEncryptionKey\HkdfGuard.DataEncryptionKey.csproj" />
+    <ProjectReference Include="..\..\..\hkdfguard-dotnet\src\HkdfGuard.SecureFile\HkdfGuard.SecureFile.csproj" />
     <ProjectReference Include="..\..\..\hkdfguard-dotnet\src\HkdfGuard.KeyWrapping.V1\HkdfGuard.KeyWrapping.V1.csproj" />
+    <ProjectReference Include="..\..\..\hkdfguard-dotnet\src\HkdfGuard.KeyWrapping.AwsKms\HkdfGuard.KeyWrapping.AwsKms.csproj" />
+    <ProjectReference Include="..\..\..\hkdfguard-dotnet\src\HkdfGuard.KeyWrapping.AzureKeyVault\HkdfGuard.KeyWrapping.AzureKeyVault.csproj" />
+    <ProjectReference Include="..\..\..\hkdfguard-dotnet\src\HkdfGuard.KeyWrapping.GoogleKms\HkdfGuard.KeyWrapping.GoogleKms.csproj" />
+    <ProjectReference Include="..\..\..\hkdfguard-dotnet\src\HkdfGuard.KeyWrapping.HashiCorpVault\HkdfGuard.KeyWrapping.HashiCorpVault.csproj" />
+    <ProjectReference Include="..\..\..\hkdfguard-dotnet\src\HkdfGuard.Cache\HkdfGuard.Cache.csproj" />
+    <ProjectReference Include="..\..\..\hkdfguard-dotnet\src\HkdfGuard.Cache.AwsSecretsManager\HkdfGuard.Cache.AwsSecretsManager.csproj" />
+    <ProjectReference Include="..\..\..\hkdfguard-dotnet\src\HkdfGuard.Cache.AzureKeyVault\HkdfGuard.Cache.AzureKeyVault.csproj" />
+    <ProjectReference Include="..\..\..\hkdfguard-dotnet\src\HkdfGuard.Cache.GoogleSecretManager\HkdfGuard.Cache.GoogleSecretManager.csproj" />
+    <ProjectReference Include="..\..\..\hkdfguard-dotnet\src\HkdfGuard.Cache.HashiCorpVault\HkdfGuard.Cache.HashiCorpVault.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- DefaultAzureCredential, for the Azure Key Vault wrapper and cache (az login). The port's
+         libraries take any TokenCredential and don't depend on it themselves. -->
+    <PackageReference Include="Azure.Identity" Version="1.21.0" />
   </ItemGroup>
 
 </Project>

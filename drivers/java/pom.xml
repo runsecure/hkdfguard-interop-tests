@@ -4,9 +4,10 @@
          xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
   <modelVersion>4.0.0</modelVersion>
 
-  <!-- The Java driver for the HkdfGuard interop matrix. The develop matrix uses the SNAPSHOT the sibling
-       hkdfguard-java checkout installs into the local repository (mvnw install -DskipTests); set
-       hkdfguard.version to a release to test the published artifacts. -->
+  <!-- The Java driver for the HkdfGuard interop matrix. The develop matrix uses the 0.9.1 the sibling
+       hkdfguard-java checkout installs into the local repository (mvnw install -DskipTests), so keep
+       hkdfguard.version at the version hkdfguard-java's parent POM declares. To test the published
+       artifacts instead, set it to a release that checkout hasn't installed. -->
   <groupId>io.github.runsecure</groupId>
   <artifactId>hkdfguard-interop-java-driver</artifactId>
   <version>0.0.0</version>
@@ -14,8 +15,73 @@
   <properties>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     <maven.compiler.release>25</maven.compiler.release>
-    <hkdfguard.version>1.0.0-SNAPSHOT</hkdfguard.version>
+    <hkdfguard.version>0.9.1</hkdfguard.version>
+    <!-- The versions hkdfguard-java's parent POM manages, so the driver runs the SDKs the library
+         was built and tested with. -->
+    <jackson.version>2.22.4</jackson.version>
+    <awssdk.version>2.57.7</awssdk.version>
+    <azuresdk.version>1.3.9</azuresdk.version>
+    <googlecloud.version>26.91.0</googlecloud.version>
+    <opentelemetry.version>1.67.0</opentelemetry.version>
+    <slf4j.version>2.0.20</slf4j.version>
+    <guava.version>33.7.2-jre</guava.version>
   </properties>
+
+  <dependencyManagement>
+    <dependencies>
+      <!-- First, so the cloud BOMs below don't pull jackson-core out of step with jackson-databind. -->
+      <dependency>
+        <groupId>com.fasterxml.jackson</groupId>
+        <artifactId>jackson-bom</artifactId>
+        <version>${jackson.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+      <!-- Then in hkdfguard-java's parent POM's order. Without these the cloud BOMs would choose
+           OpenTelemetry and SLF4J too, and an SLF4J 1.7 API breaks the libraries' logging. -->
+      <dependency>
+        <groupId>io.opentelemetry</groupId>
+        <artifactId>opentelemetry-bom</artifactId>
+        <version>${opentelemetry.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+      <dependency>
+        <groupId>org.slf4j</groupId>
+        <artifactId>slf4j-api</artifactId>
+        <version>${slf4j.version}</version>
+      </dependency>
+      <!-- hkdfguard-java's override of libraries-bom's Guava (GHSA-xxph-c9ww-hj94). -->
+      <dependency>
+        <groupId>com.google.guava</groupId>
+        <artifactId>guava</artifactId>
+        <version>${guava.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>software.amazon.awssdk</groupId>
+        <artifactId>bom</artifactId>
+        <version>${awssdk.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+      <dependency>
+        <groupId>com.azure</groupId>
+        <artifactId>azure-sdk-bom</artifactId>
+        <version>${azuresdk.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+      <!-- Last, as in hkdfguard-java: where it manages an artifact a BOM above also manages, the one
+           above wins. -->
+      <dependency>
+        <groupId>com.google.cloud</groupId>
+        <artifactId>libraries-bom</artifactId>
+        <version>${googlecloud.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
 
   <dependencies>
     <dependency>
@@ -35,25 +101,131 @@
     </dependency>
     <dependency>
       <groupId>io.github.runsecure</groupId>
+      <artifactId>hkdfguard-securefile</artifactId>
+      <version>${hkdfguard.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>io.github.runsecure</groupId>
       <artifactId>hkdfguard-keywrapping-v1</artifactId>
       <version>${hkdfguard.version}</version>
     </dependency>
     <dependency>
+      <groupId>io.github.runsecure</groupId>
+      <artifactId>hkdfguard-keywrapping-awskms</artifactId>
+      <version>${hkdfguard.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>io.github.runsecure</groupId>
+      <artifactId>hkdfguard-keywrapping-azurekeyvault</artifactId>
+      <version>${hkdfguard.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>io.github.runsecure</groupId>
+      <artifactId>hkdfguard-keywrapping-googlekms</artifactId>
+      <version>${hkdfguard.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>io.github.runsecure</groupId>
+      <artifactId>hkdfguard-keywrapping-hashicorpvault</artifactId>
+      <version>${hkdfguard.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>io.github.runsecure</groupId>
+      <artifactId>hkdfguard-integration-hashicorpvault</artifactId>
+      <version>${hkdfguard.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>io.github.runsecure</groupId>
+      <artifactId>hkdfguard-cache</artifactId>
+      <version>${hkdfguard.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>io.github.runsecure</groupId>
+      <artifactId>hkdfguard-cache-awssecretsmanager</artifactId>
+      <version>${hkdfguard.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>io.github.runsecure</groupId>
+      <artifactId>hkdfguard-cache-azurekeyvault</artifactId>
+      <version>${hkdfguard.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>io.github.runsecure</groupId>
+      <artifactId>hkdfguard-cache-googlesecretmanager</artifactId>
+      <version>${hkdfguard.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>io.github.runsecure</groupId>
+      <artifactId>hkdfguard-cache-hashicorpvault</artifactId>
+      <version>${hkdfguard.version}</version>
+    </dependency>
+
+    <!-- The libraries leave the HTTP client to the application: the AWS SDK's Netty client, and the
+         JDK's HttpClient for Azure (with DefaultAzureCredential, which also needs one). -->
+    <dependency>
+      <groupId>software.amazon.awssdk</groupId>
+      <artifactId>netty-nio-client</artifactId>
+    </dependency>
+    <!-- The AWS SDK's default credential chain reads an aws login session only with this module. -->
+    <dependency>
+      <groupId>software.amazon.awssdk</groupId>
+      <artifactId>signin</artifactId>
+      <scope>runtime</scope>
+    </dependency>
+    <dependency>
+      <groupId>com.azure</groupId>
+      <artifactId>azure-identity</artifactId>
+      <exclusions>
+        <exclusion>
+          <groupId>com.azure</groupId>
+          <artifactId>azure-core-http-netty</artifactId>
+        </exclusion>
+      </exclusions>
+    </dependency>
+    <dependency>
+      <groupId>com.azure</groupId>
+      <artifactId>azure-core-http-jdk-httpclient</artifactId>
+    </dependency>
+
+    <dependency>
       <groupId>com.fasterxml.jackson.core</groupId>
       <artifactId>jackson-databind</artifactId>
-      <version>2.22.4</version>
     </dependency>
     <!-- The libraries log through SLF4J; the driver reports through its own output. -->
     <dependency>
       <groupId>org.slf4j</groupId>
       <artifactId>slf4j-nop</artifactId>
-      <version>2.0.20</version>
+      <version>${slf4j.version}</version>
       <scope>runtime</scope>
     </dependency>
   </dependencies>
 
   <build>
     <plugins>
+      <!-- Empties target/lib before every build: the matrix packages without clean, and a jar left
+           there from an earlier version would join the class path. -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-clean-plugin</artifactId>
+        <version>3.4.1</version>
+        <executions>
+          <execution>
+            <id>clean-lib</id>
+            <phase>initialize</phase>
+            <goals>
+              <goal>clean</goal>
+            </goals>
+            <configuration>
+              <excludeDefaultDirectories>true</excludeDefaultDirectories>
+              <filesets>
+                <fileset>
+                  <directory>${project.build.directory}/lib</directory>
+                </fileset>
+              </filesets>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
       <!-- Copies the runtime classpath to target/lib, so the matrix runs the driver with plain java. -->
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>

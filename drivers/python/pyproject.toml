@@ -10,6 +10,19 @@ dependencies = [
     "hkdfguard-cryptoprovider-aesgcm256",
     "hkdfguard-keywrapping-v1",
     "hkdfguard-dataencryptionkey",
+    "hkdfguard-securefile",
+    "hkdfguard-keywrapping-awskms",
+    "hkdfguard-keywrapping-azurekeyvault",
+    "hkdfguard-keywrapping-googlekms",
+    "hkdfguard-keywrapping-hashicorpvault",
+    "hkdfguard-integration-hashicorpvault",
+    "hkdfguard-cache",
+    "hkdfguard-cache-awssecretsmanager",
+    "hkdfguard-cache-azurekeyvault",
+    "hkdfguard-cache-googlesecretmanager",
+    "hkdfguard-cache-hashicorpvault",
+    # No port distribution depends on it: the driver signs in to Azure with DefaultAzureCredential.
+    "azure-identity>=1.25",
 ]
 
 [tool.uv]
@@ -21,3 +34,14 @@ hkdfguard-abstractions = { path = "../../../hkdfguard-python/packages/hkdfguard-
 hkdfguard-cryptoprovider-aesgcm256 = { path = "../../../hkdfguard-python/packages/hkdfguard-cryptoprovider-aesgcm256", editable = true }
 hkdfguard-keywrapping-v1 = { path = "../../../hkdfguard-python/packages/hkdfguard-keywrapping-v1", editable = true }
 hkdfguard-dataencryptionkey = { path = "../../../hkdfguard-python/packages/hkdfguard-dataencryptionkey", editable = true }
+hkdfguard-securefile = { path = "../../../hkdfguard-python/packages/hkdfguard-securefile", editable = true }
+hkdfguard-keywrapping-awskms = { path = "../../../hkdfguard-python/packages/hkdfguard-keywrapping-awskms", editable = true }
+hkdfguard-keywrapping-azurekeyvault = { path = "../../../hkdfguard-python/packages/hkdfguard-keywrapping-azurekeyvault", editable = true }
+hkdfguard-keywrapping-googlekms = { path = "../../../hkdfguard-python/packages/hkdfguard-keywrapping-googlekms", editable = true }
+hkdfguard-keywrapping-hashicorpvault = { path = "../../../hkdfguard-python/packages/hkdfguard-keywrapping-hashicorpvault", editable = true }
+hkdfguard-integration-hashicorpvault = { path = "../../../hkdfguard-python/packages/hkdfguard-integration-hashicorpvault", editable = true }
+hkdfguard-cache = { path = "../../../hkdfguard-python/packages/hkdfguard-cache", editable = true }
+hkdfguard-cache-awssecretsmanager = { path = "../../../hkdfguard-python/packages/hkdfguard-cache-awssecretsmanager", editable = true }
+hkdfguard-cache-azurekeyvault = { path = "../../../hkdfguard-python/packages/hkdfguard-cache-azurekeyvault", editable = true }
+hkdfguard-cache-googlesecretmanager = { path = "../../../hkdfguard-python/packages/hkdfguard-cache-googlesecretmanager", editable = true }
+hkdfguard-cache-hashicorpvault = { path = "../../../hkdfguard-python/packages/hkdfguard-cache-hashicorpvault", editable = true }
