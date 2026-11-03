@@ -5,10 +5,10 @@ import (
 	"fmt"
 	"os"
 
+	googlekmsapi "cloud.google.com/go/kms/apiv1"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/kms"
-	googlekmsapi "cloud.google.com/go/kms/apiv1"
 	"github.com/hashicorp/vault/api"
 
 	"github.com/runsecure/hkdfguard-go"

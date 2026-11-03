@@ -550,12 +550,14 @@ source = { editable = "../../../hkdfguard-python/packages/hkdfguard-cache" }
 dependencies = [
     { name = "hkdfguard-abstractions" },
     { name = "hkdfguard-diagnostics" },
+    { name = "hkdfguard-securefile" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "hkdfguard-abstractions", editable = "../../../hkdfguard-python/packages/hkdfguard-abstractions" },
     { name = "hkdfguard-diagnostics", editable = "../../../hkdfguard-python/packages/hkdfguard-diagnostics" },
+    { name = "hkdfguard-securefile", editable = "../../../hkdfguard-python/packages/hkdfguard-securefile" },
 ]
 
 [[package]]

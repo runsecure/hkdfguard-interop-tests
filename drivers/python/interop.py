@@ -19,8 +19,8 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlsplit
 
-from hkdfguard.abstractions import ArrayUtility, KeyWrapper, ProtectedConfigurationPurpose, ProtectedReadOnlyCache, WrappedKeyLimits
-from hkdfguard.cache import ProtectedCache
+from hkdfguard.abstractions import ArrayUtility, AuthenticationTagMismatchError, KeyWrapper, ProtectedConfigurationPurpose, ProtectedReadOnlyCache, WrappedKeyLimits
+from hkdfguard.cache import FilePerSecretCache, ProtectedCache
 from hkdfguard.cryptoprovider.aesgcm256 import AesGcmCryptoProviderFactory, AesGcmPipelineDataProtector
 from hkdfguard.dataencryptionkey import DefaultFormatProvider, KeyRing, KeyRingBuilder
 from hkdfguard.keywrapping.v1 import NativeHkdfKeyWrapperV1
@@ -28,6 +28,7 @@ from hkdfguard.securefile import KeyFileTrust
 
 RELEASE_FILE = "release.json"
 KEY_FILE = "dek.wrapped"
+SECRETS_DIR = "secrets"
 KEY_SIZE = 32
 FORMAT = re.compile(r"^(enc::v\d+::)(.+)$", re.DOTALL)
 
@@ -65,6 +66,7 @@ def produce(wrapper_name: str, service: str, fixtures: dict[str, Any], directory
         # Python 3.13+ gives such a folder an owner-only protected ACL, which the network wrappers'
         # key file checks refuse.
         directory.mkdir(**({} if os.name == "nt" else {"mode": 0o700}), parents=True, exist_ok=True)
+        write_secret_files(pipeline, fixtures, directory / SECRETS_DIR)
         path = directory / KEY_FILE
         if wrapper_name == NATIVE:
             # The protector's own read-only view goes to stdin as it is: no copy of the key is made here.
@@ -138,7 +140,74 @@ def consume(wrapper_name: str, service: str, fixtures: dict[str, Any], directory
                     checks.fail(f"creating a wrapper with another context: {error}")
 
         check_cache(checks, ProtectedCache(ring), fixtures)
+        check_secret_files(checks, ring, fixtures, directory / SECRETS_DIR)
         return checks.finish(f"the {release['producer']} {release['wrapper']} release")
+
+
+def file_plaintext(fixtures: dict[str, Any], file: dict[str, Any]) -> str:
+    """The value ``file`` is written with: its own, or the named secret's."""
+    if file.get("plaintextOf"):
+        for s in fixtures["secrets"]:
+            if s["identifier"] == file["plaintextOf"]:
+                return s["plaintext"]
+    return file.get("plaintext", "")
+
+
+def write_secret_files(pipeline: AesGcmPipelineDataProtector, fixtures: dict[str, Any], folder: Path) -> None:
+    """Writes the release's secrets folder as a pipeline would for FilePerSecretCache: one file per
+    secret, holding its value encrypted under the pipeline key for the file's own name."""
+    # Never with mode 0o700 on Windows, as for the release's folder.
+    folder.mkdir(**({} if os.name == "nt" else {"mode": 0o700}), parents=True, exist_ok=True)
+    written: dict[str, bytes] = {}
+    for file in fixtures["files"]:
+        if file.get("empty"):
+            contents = b""
+        elif file.get("copyOf"):
+            contents = written[file["copyOf"]]
+        else:
+            try:
+                contents = pipeline.encrypt(file_plaintext(fixtures, file), file["name"]).encode("ascii")
+            except Exception as error:
+                raise RuntimeError(f"encrypting the file {file['name']}: {type(error).__name__}: {error}") from error
+            if file.get("trailingNewline"):
+                contents += b"\n"
+        written[file["name"]] = contents
+        with os.fdopen(os.open(folder / file["name"], os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_BINARY", 0), 0o600), "wb") as out:
+            out.write(contents)
+
+
+def check_secret_files(checks: Checker, ring: KeyRing, fixtures: dict[str, Any], folder: Path) -> None:
+    """Reads the release's secrets folder through a FilePerSecretCache over the release's ring: each
+    file reads as its value, is missing, or is refused as its fixture expects, and a name no file can
+    answer - one that isn't a file name in the folder - is missing."""
+    trust, error = attempt(key_file_trust)
+    if error is not None:
+        checks.fail(f"files: trusting this account: {error}")
+        return
+    files, error = attempt(lambda: FilePerSecretCache(folder, trust, ring, DefaultFormatProvider()))
+    if error is not None:
+        checks.fail(f"files: opening the secrets folder: {error}")
+        return
+    for file in fixtures["files"]:
+        name, expect = file["name"], file["expect"]
+        got: str | None = None
+        failure: Exception | None = None
+        try:
+            got = read_cache(files, name)
+        except Exception as caught:  # noqa: BLE001 - any failure is the answer being checked
+            failure = caught
+        error = None if failure is None else f"{type(failure).__name__}: {failure}"
+        if expect == "value":
+            checks.check(failure is None and got == file_plaintext(fixtures, file), f"files: {name} reads as its value: got {size(got)} bytes, {error}")
+        elif expect == "missing":
+            checks.check(failure is None and got == "", f"files: {name} is missing: got {size(got)} bytes, {error}")
+        elif expect == "refused":
+            checks.check(isinstance(failure, AuthenticationTagMismatchError), f"files: {name} fails authentication: {error}")
+        else:
+            checks.fail(f"files: {name} expects {expect!r}, which isn't value, missing or refused")
+    for name in fixtures["missingFiles"]:
+        got, error = attempt(lambda: read_cache(files, name))
+        checks.check(error is None and got == "", f"files: {name} is missing: got {size(got)} bytes, {error}")
 
 
 def open_release(wrapper_name: str, service: str, directory: Path, stack: contextlib.ExitStack) -> tuple[dict[str, Any], KeyWrapper, KeyRing]:

@@ -22,6 +22,7 @@ import (
 
 	"github.com/runsecure/hkdfguard-go"
 	"github.com/runsecure/hkdfguard-go/cache"
+	"github.com/runsecure/hkdfguard-go/cache/filepersecret"
 	"github.com/runsecure/hkdfguard-go/cryptoprovider/aesgcm256"
 	"github.com/runsecure/hkdfguard-go/dek"
 )
@@ -29,6 +30,7 @@ import (
 const (
 	releaseFile  = "release.json"
 	keyFile      = "dek.wrapped"
+	secretsDir   = "secrets"
 	formatPrefix = "enc::v"
 )
 
@@ -39,9 +41,35 @@ type secret struct {
 	MustNotReadAs []string `json:"mustNotReadAs,omitempty"`
 }
 
+// secretFile is one file a producer writes to the release's secrets folder, and what every
+// consumer's FilePerSecretCache must make of it: "value", "missing" or "refused".
+type secretFile struct {
+	Name            string `json:"name"`
+	Plaintext       string `json:"plaintext,omitempty"`
+	PlaintextOf     string `json:"plaintextOf,omitempty"`
+	TrailingNewline bool   `json:"trailingNewline,omitempty"`
+	Empty           bool   `json:"empty,omitempty"`
+	CopyOf          string `json:"copyOf,omitempty"`
+	Expect          string `json:"expect"`
+}
+
 type fixtures struct {
-	KeyVersion int      `json:"keyVersion"`
-	Secrets    []secret `json:"secrets"`
+	KeyVersion   int          `json:"keyVersion"`
+	Secrets      []secret     `json:"secrets"`
+	Files        []secretFile `json:"files"`
+	MissingFiles []string     `json:"missingFiles"`
+}
+
+// plaintext is the value the file is written with: its own, or the named secret's.
+func (f fixtures) plaintext(file secretFile) string {
+	if file.PlaintextOf != "" {
+		for _, s := range f.Secrets {
+			if s.Identifier == file.PlaintextOf {
+				return s.Plaintext
+			}
+		}
+	}
+	return file.Plaintext
 }
 
 type release struct {
@@ -146,6 +174,9 @@ func produce(wrapperName, service string, f fixtures, dir, cli string) error {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
+	if err := writeSecretFiles(pipeline, f, filepath.Join(dir, secretsDir)); err != nil {
+		return err
+	}
 	path := filepath.Join(dir, keyFile)
 	if wrapperName == native {
 		wrap := exec.Command(cli, "wrap", "-kf", path, "-sn", service, "--dek-stdin")
@@ -237,7 +268,72 @@ func consume(wrapperName, service string, f fixtures, dir string) error {
 	}
 
 	checkCache(c, cache.New(ring), f)
+	checkSecretFiles(c, ring, f, filepath.Join(dir, secretsDir))
 	return c.result(fmt.Sprintf("the %s %s release", r.Producer, r.Wrapper))
+}
+
+// writeSecretFiles writes the release's secrets folder as a pipeline would for FilePerSecretCache:
+// one file per secret, holding its value encrypted under the pipeline key for the file's own name.
+func writeSecretFiles(pipeline *aesgcm256.PipelineDataProtector, f fixtures, folder string) error {
+	if err := os.MkdirAll(folder, 0o700); err != nil {
+		return err
+	}
+	written := make(map[string][]byte, len(f.Files))
+	for _, file := range f.Files {
+		var contents []byte
+		switch {
+		case file.Empty:
+		case file.CopyOf != "":
+			contents = written[file.CopyOf]
+		default:
+			value, err := pipeline.Encrypt(ctx, []byte(f.plaintext(file)), file.Name)
+			if err != nil {
+				return fmt.Errorf("encrypting the file %s: %w", file.Name, err)
+			}
+			contents = []byte(value)
+			if file.TrailingNewline {
+				contents = append(contents, '\n')
+			}
+		}
+		written[file.Name] = contents
+		if err := os.WriteFile(filepath.Join(folder, file.Name), contents, 0o600); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// checkSecretFiles reads the release's secrets folder through a FilePerSecretCache over the release's
+// ring: each file reads as its value, is missing, or is refused as its fixture expects, and a name no
+// file can answer - one that isn't a file name in the folder - is missing.
+func checkSecretFiles(c *checker, ring *dek.KeyRing, f fixtures, folder string) {
+	trust, err := keyFileTrust()
+	if err != nil {
+		c.fail("files: trusting this account: %v", err)
+		return
+	}
+	files, err := filepersecret.New(folder, trust, ring, dek.NewDefaultFormatProvider(), filepersecret.Options{})
+	if err != nil {
+		c.fail("files: opening the secrets folder: %v", err)
+		return
+	}
+	for _, file := range f.Files {
+		got, err := readCache(files, file.Name)
+		switch file.Expect {
+		case "value":
+			c.check(err == nil && got == f.plaintext(file), "files: %s reads as its value: got %d bytes, %v", file.Name, len(got), err)
+		case "missing":
+			c.check(err == nil && got == "", "files: %s is missing: got %d bytes, %v", file.Name, len(got), err)
+		case "refused":
+			c.check(errors.Is(err, hkdfguard.ErrAuthenticationFailed), "files: %s fails authentication: %v", file.Name, err)
+		default:
+			c.fail("files: %s expects %q, which isn't value, missing or refused", file.Name, file.Expect)
+		}
+	}
+	for _, name := range f.MissingFiles {
+		got, err := readCache(files, name)
+		c.check(err == nil && got == "", "files: %s is missing: got %d bytes, %v", name, len(got), err)
+	}
 }
 
 // openRelease reads dir's release and builds a ring over its key file with this port of the

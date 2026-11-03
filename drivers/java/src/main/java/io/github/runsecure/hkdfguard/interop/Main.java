@@ -4,18 +4,21 @@ import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
 import io.github.runsecure.hkdfguard.abstractions.ArrayUtility;
+import io.github.runsecure.hkdfguard.abstractions.CryptographicException;
 import io.github.runsecure.hkdfguard.abstractions.KeyWrapper;
 import io.github.runsecure.hkdfguard.abstractions.ProtectedCache;
 import io.github.runsecure.hkdfguard.abstractions.ProtectedConfigurationPurpose;
 import io.github.runsecure.hkdfguard.abstractions.ProtectedReadOnlyCache;
 import io.github.runsecure.hkdfguard.abstractions.WrappedKeyLimits;
 import io.github.runsecure.hkdfguard.cache.ProtectedCacheImpl;
+import io.github.runsecure.hkdfguard.cache.filepersecret.FilePerSecretCacheImpl;
 import io.github.runsecure.hkdfguard.cryptoprovider.aesgcm256.AesGcmCryptoProviderFactoryImpl;
 import io.github.runsecure.hkdfguard.cryptoprovider.aesgcm256.AesGcmPipelineDataProtectorImpl;
 import io.github.runsecure.hkdfguard.dataencryptionkey.KeyRingBuilder;
 import io.github.runsecure.hkdfguard.dataencryptionkey.KeyRingImpl;
 import io.github.runsecure.hkdfguard.dataencryptionkey.formatprovider.DefaultFormatProviderImpl;
 import io.github.runsecure.hkdfguard.interop.Wrappers.OpenWrapper;
+import io.github.runsecure.hkdfguard.securefile.KeyFileTrust;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.FileSystems;
 import java.nio.file.Files;
@@ -45,6 +48,7 @@ import java.util.regex.Pattern;
 public final class Main {
     static final String RELEASE_FILE = "release.json";
     static final String KEY_FILE = "dek.wrapped";
+    static final String SECRETS_DIR = "secrets";
     private static final int KEY_SIZE = 32;
     private static final Pattern FORMAT = Pattern.compile("^(enc::v\\d+::)(.+)$", Pattern.DOTALL);
     private static final Set<String> OPTIONS = Set.of("--wrapper", "--store", "--service", "--fixtures", "--dir", "--cli");
@@ -67,7 +71,30 @@ public final class Main {
         }
     }
 
-    record Fixtures(int keyVersion, List<Secret> secrets) {}
+    /**
+     * One file a producer writes to the release's secrets folder, and what every consumer's
+     * FilePerSecretCache must make of it: "value", "missing" or "refused".
+     */
+    record SecretFile(String name, String plaintext, String plaintextOf, boolean trailingNewline, boolean empty, String copyOf, String expect) {}
+
+    record Fixtures(int keyVersion, List<Secret> secrets, List<SecretFile> files, List<String> missingFiles) {
+        Fixtures {
+            files = files != null ? files : List.of();
+            missingFiles = missingFiles != null ? missingFiles : List.of();
+        }
+
+        /** The value the file is written with: its own, or the named secret's. */
+        String plaintext(SecretFile file) {
+            if (file.plaintextOf() != null && !file.plaintextOf().isEmpty()) {
+                for (var s : secrets) {
+                    if (s.identifier().equals(file.plaintextOf())) {
+                        return s.plaintext();
+                    }
+                }
+            }
+            return file.plaintext() != null ? file.plaintext() : "";
+        }
+    }
 
     record Release(String producer, String wrapper, String service, int keyVersion, String dekSha256, Map<String, String> values) {}
 
@@ -151,6 +178,7 @@ public final class Main {
                 var digest = HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(raw));
 
                 Files.createDirectories(dir);
+                writeSecretFiles(pipeline, fixtures, dir.resolve(SECRETS_DIR));
                 var path = dir.resolve(KEY_FILE);
                 if (wrapperName.equals(Wrappers.NATIVE)) {
                     wrapNatively(cli, path, service, keyText);
@@ -296,6 +324,7 @@ public final class Main {
             }
 
             checkCache(checks, new ProtectedCacheImpl(ring), fixtures);
+            checkSecretFiles(checks, ring, fixtures, dir.resolve(SECRETS_DIR));
             return checks.finish("the " + release.producer() + " " + release.wrapper() + " release");
         }
     }
@@ -340,6 +369,71 @@ public final class Main {
                 checks.check(result.failedWith(IllegalArgumentException.class),
                         "cache: adding " + s.identifier() + " again as " + again + " is refused: " + result.error());
             }
+        }
+    }
+
+    /**
+     * Writes the release's secrets folder as a pipeline would for FilePerSecretCache: one file per
+     * secret, holding its value encrypted under the pipeline key for the file's own name.
+     */
+    private static void writeSecretFiles(AesGcmPipelineDataProtectorImpl pipeline, Fixtures fixtures, Path folder) throws Exception {
+        Files.createDirectories(folder);
+        var written = new HashMap<String, byte[]>();
+        for (var file : fixtures.files()) {
+            byte[] contents;
+            if (file.empty()) {
+                contents = new byte[0];
+            } else if (file.copyOf() != null && !file.copyOf().isEmpty()) {
+                contents = written.getOrDefault(file.copyOf(), new byte[0]);
+            } else {
+                String value;
+                try {
+                    value = pipeline.encrypt(fixtures.plaintext(file), file.name());
+                } catch (Exception e) {
+                    throw new IllegalStateException("encrypting the file " + file.name() + ": " + describe(e), e);
+                }
+                contents = (file.trailingNewline() ? value + "\n" : value).getBytes(StandardCharsets.UTF_8);
+            }
+            written.put(file.name(), contents);
+            writePrivate(folder.resolve(file.name()), contents);
+        }
+    }
+
+    /**
+     * Reads the release's secrets folder through a FilePerSecretCache over the release's ring: each
+     * file reads as its value, is missing, or is refused as its fixture expects, and a name no file can
+     * answer - one that isn't a file name in the folder - is missing.
+     */
+    private static void checkSecretFiles(Checker checks, KeyRingImpl ring, Fixtures fixtures, Path folder) {
+        KeyFileTrust trust;
+        try {
+            trust = Wrappers.keyFileTrust();
+        } catch (Exception e) {
+            checks.fail("files: trusting this account: " + describe(e));
+            return;
+        }
+        FilePerSecretCacheImpl files;
+        try {
+            files = new FilePerSecretCacheImpl(folder, trust, ring, new DefaultFormatProviderImpl());
+        } catch (Exception e) {
+            checks.fail("files: opening the secrets folder: " + describe(e));
+            return;
+        }
+        for (var file : fixtures.files()) {
+            var result = attempt(() -> readCache(files, file.name()));
+            switch (file.expect()) {
+                case "value" -> checks.check(result.error() == null && fixtures.plaintext(file).equals(result.got()),
+                        "files: " + file.name() + " reads as its value: " + result);
+                case "missing" -> checks.check(result.error() == null && result.got().isEmpty(),
+                        "files: " + file.name() + " is missing: " + result);
+                case "refused" -> checks.check(result.failedWith(CryptographicException.class),
+                        "files: " + file.name() + " fails authentication: " + result.error());
+                default -> checks.fail("files: " + file.name() + " expects \"" + file.expect() + "\", which isn't value, missing or refused");
+            }
+        }
+        for (var name : fixtures.missingFiles()) {
+            var result = attempt(() -> readCache(files, name));
+            checks.check(result.error() == null && result.got().isEmpty(), "files: " + name + " is missing: " + result);
         }
     }
 

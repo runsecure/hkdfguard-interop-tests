@@ -22,11 +22,12 @@ producer (dotnet | go | java | node | python)   consumer (dotnet | go | java | n
 -------------------------------------------     -------------------------------------------------
 pipeline protector generates a 32-byte DEK
 encrypts every fixture -> release.json    ───>  builds a KeyRing over its own port of the wrapper
-wraps the DEK -> dek.wrapped                    reveals every value under its configuration purpose
-  native: hkdfguard wrap --dek-stdin            runs the negative checks
-  others: the port's wrapper, in process        unwraps dek.wrapped, compares the DEK's hash
-                                                refuses dek.wrapped under another context
-                                                caches every value in a ProtectedCache over the ring
+encrypts each file fixture for its name         reveals every value under its configuration purpose
+  -> secrets/<name>, one file per secret        runs the negative checks
+wraps the DEK -> dek.wrapped                    unwraps dek.wrapped, compares the DEK's hash
+  native: hkdfguard wrap --dek-stdin            refuses dek.wrapped under another context
+  others: the port's wrapper, in process        caches every value in a ProtectedCache over the ring
+                                                reads secrets/ through a FilePerSecretCache over it
                                          ───>  cache: reads each remote secret store through its
                                                 own port of that store's cache, over the same ring
 ```
@@ -148,8 +149,8 @@ folder is removed afterwards unless you pass `--keep`.
 
 ## What each consumer checks
 
-Every secret in [fixtures/secrets.json](fixtures/secrets.json) is checked, 24 checks per native
-release and 25 per network one:
+Every secret in [fixtures/secrets.json](fixtures/secrets.json) is checked, 33 checks per native
+release and 34 per network one:
 
 - Each value decrypts to its fixture's plaintext under its key's configuration purpose. That
   includes an empty value, non-ASCII text and emoji, and a 3,000-byte value close to the
@@ -166,6 +167,14 @@ release and 25 per network one:
   reads under its identifier and its `alsoReadAs` names (the cache ignores ASCII case), and is
   missing under its `mustNotReadAs` names. The empty value is refused, since a cache reports a
   missing name as 0 bytes, and adding a value again under another ASCII case is refused.
+- Last, the release's `secrets/` folder is read through a `FilePerSecretCache` over the same ring,
+  trusting the consumer's own account as the network wrappers do. Each file in the fixtures' `files`
+  must be what its `expect` says. `value`: a file encrypted for its own name reads as its plaintext,
+  including one with a trailing newline, non-ASCII text, and the 3,000-byte value. `missing`: an
+  empty file, and a file whose name starts with `.`, which is no secret's name. `refused`: a copy of
+  another secret's file fails authentication, since every value is bound to its file name. Each of
+  `missingFiles`, names no file can answer such as `ConnectionStrings:Admin` and `../release.json`,
+  is missing without anything outside the folder being read.
 
 **Don't copy the DEK hash into a real pipeline.** Nothing derived from a DEK belongs beside its
 key file: a hash lets anyone holding the file confirm a guessed or leaked key, and it tells an
@@ -204,10 +213,15 @@ consume [--wrapper W] --service S --fixtures F --dir D
 cache --store C [--wrapper W] --service S --fixtures F --dir D
 ```
 
-`produce` writes two files to `D`, which the matrix creates first:
+`produce` writes these to `D`, which the matrix creates first:
 - `release.json`, holding `producer`, `wrapper`, `service`, `keyVersion`, `dekSha256` and `values`
   (identifier to `enc::v<version>::<base64>`)
 - `dek.wrapped`, the key file
+- `secrets/`, one file per entry of the fixtures' `files`, named by its `name`. It holds, encrypted
+  by the same pipeline protector for that name, its `plaintext` or the `plaintext` of the secret
+  `plaintextOf` names, followed by a newline when `trailingNewline` is set. If `empty` is set the file
+  is empty, and if `copyOf` is set it is a byte-for-byte copy of that earlier file. On Windows,
+  create the folder without an owner-only ACL, as the matrix does for `D`.
 
 For `native`, the producer creates the key file by piping the pipeline key's base64 to
 `hkdfguard wrap -kf D/dek.wrapped -sn S --dek-stdin`, never as an argument or environment variable.

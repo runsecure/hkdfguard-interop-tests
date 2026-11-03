@@ -14,6 +14,7 @@ using HkdfGuard.CryptoProvider.AesGcm256;
 using HkdfGuard.DataEncryptionKey;
 using HkdfGuard.DataEncryptionKey.FormatProvider;
 using HkdfGuard.Interop;
+using HkdfGuard.SecureFile;
 
 var command = args.Length > 0 ? args[0] : null;
 var wrapperName = Option("--wrapper") ?? Driver.Native;
@@ -57,6 +58,7 @@ namespace HkdfGuard.Interop
     {
         private const string ReleaseFile = "release.json";
         private const string KeyFile = "dek.wrapped";
+        private const string SecretsDir = "secrets";
         private const int KeySize = 32;
 
         public static readonly JsonSerializerOptions Json = new() { PropertyNamingPolicy = JsonNamingPolicy.CamelCase, WriteIndented = true };
@@ -85,6 +87,7 @@ namespace HkdfGuard.Interop
                 var digest = Convert.ToHexStringLower(SHA256.HashData(dek));
 
                 Directory.CreateDirectory(dir);
+                await WriteSecretFiles(pipeline, fixtures, Path.Combine(dir, SecretsDir));
                 var path = Path.Combine(dir, KeyFile);
                 if (wrapperName == Native)
                 {
@@ -219,7 +222,90 @@ namespace HkdfGuard.Interop
             }
 
             await CheckCache(checks, new ProtectedCache(ring), fixtures);
+            await CheckSecretFiles(checks, ring, fixtures, Path.Combine(dir, SecretsDir));
             return checks.Finish($"the {release.Producer} {release.Wrapper} release");
+        }
+
+        // Writes the release's secrets folder as a pipeline would for FilePerSecretCache: one file per
+        // secret, holding its value encrypted under the pipeline key for the file's own name. The
+        // folder gets no owner-only ACL on Windows; its parent's inherited one applies.
+        private static async Task WriteSecretFiles(AesGcmPipelineDataProtector pipeline, Fixtures fixtures, string folder)
+        {
+            Directory.CreateDirectory(folder);
+            var written = new Dictionary<string, byte[]>(fixtures.Files.Length);
+            foreach (var file in fixtures.Files)
+            {
+                byte[] contents;
+                if (file.Empty)
+                {
+                    contents = [];
+                }
+                else if (file.CopyOf is { Length: > 0 } original)
+                {
+                    contents = written[original];
+                }
+                else
+                {
+                    var value = pipeline.Encrypt(fixtures.PlaintextOf(file), file.Name);
+                    contents = Encoding.UTF8.GetBytes(file.TrailingNewline ? value + "\n" : value);
+                }
+                written[file.Name] = contents;
+                await File.WriteAllBytesAsync(Path.Combine(folder, file.Name), contents);
+            }
+        }
+
+        // Reads the release's secrets folder through a FilePerSecretCache over the release's ring: each
+        // file reads as its value, is missing, or is refused as its fixture expects, and a name no file
+        // can answer - one that isn't a file name in the folder - is missing.
+        private static async Task CheckSecretFiles(Checker checks, KeyRing ring, Fixtures fixtures, string folder)
+        {
+            FilePerSecretCache files;
+            try
+            {
+                files = new FilePerSecretCache(folder, KeyFileTrustForThisAccount(), ring, new DefaultFormatProvider());
+            }
+            catch (Exception e)
+            {
+                checks.Fail($"files: opening the secrets folder: {Describe(e)}");
+                return;
+            }
+            foreach (var file in fixtures.Files)
+            {
+                var (got, error) = await ReadCaught(files, file.Name);
+                switch (file.Expect)
+                {
+                    case "value":
+                        checks.Check(error is null && got == fixtures.PlaintextOf(file), $"files: {file.Name} reads as its value: got {Bytes(got)} bytes, {(error is null ? "wrong plaintext" : Describe(error))}");
+                        break;
+                    case "missing":
+                        checks.Check(error is null && got == "", $"files: {file.Name} is missing: got {Bytes(got)} bytes, {Describe(error)}");
+                        break;
+                    case "refused":
+                        // The specific authentication failure: AES-GCM's tag mismatch, not just any error.
+                        checks.Check(error is AuthenticationTagMismatchException, $"files: {file.Name} fails authentication: {Describe(error)}");
+                        break;
+                    default:
+                        checks.Fail($"files: {file.Name} expects \"{file.Expect}\", which isn't value, missing or refused");
+                        break;
+                }
+            }
+            foreach (var name in fixtures.MissingFiles)
+            {
+                var (got, error) = await ReadCaught(files, name);
+                checks.Check(error is null && got == "", $"files: {name} is missing: got {Bytes(got)} bytes, {Describe(error)}");
+            }
+        }
+
+        private static async Task<(string? Got, Exception? Error)> ReadCaught(IProtectedReadOnlyCache cache, string name)
+        {
+            try
+            {
+                return (await ReadCache(cache, name), null);
+            }
+            catch (Exception e)
+            {
+                return (null, e);
+            }
         }
 
         // Reads dir's release and builds a ring over its key file with this port of the release's
@@ -403,7 +489,24 @@ namespace HkdfGuard.Interop
         string[]? AlsoReadAs,
         string[]? MustNotReadAs);
 
-    internal sealed record Fixtures(int KeyVersion, Secret[] Secrets);
+    // One file a producer writes to the release's secrets folder, and what every consumer's
+    // FilePerSecretCache must make of it: "value", "missing" or "refused".
+    internal sealed record SecretFile(
+        string Name,
+        string? Plaintext,
+        string? PlaintextOf,
+        bool TrailingNewline,
+        bool Empty,
+        string? CopyOf,
+        string Expect);
+
+    internal sealed record Fixtures(int KeyVersion, Secret[] Secrets, SecretFile[] Files, string[] MissingFiles)
+    {
+        // The value file is written with: its own, or the named secret's.
+        public string PlaintextOf(SecretFile file)
+            => (file.PlaintextOf is { Length: > 0 } of ? Secrets.FirstOrDefault(s => s.Identifier == of)?.Plaintext : null)
+                ?? file.Plaintext ?? "";
+    }
 
     internal sealed record Release(
         string Producer,

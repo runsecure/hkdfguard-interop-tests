@@ -13,8 +13,8 @@ const { KMSClient } = require('@aws-sdk/client-kms');
 const { SecretsManagerClient } = require('@aws-sdk/client-secrets-manager');
 const { DefaultAzureCredential } = require('@azure/identity');
 const { KeyManagementServiceClient } = require('@google-cloud/kms');
-const { AlreadyExistsError, configurationPurpose, MAX_WRAPPED_KEY_BYTES, wipe } = require('@runsecure/hkdfguard-abstractions');
-const { EmptyValueError, ProtectedCache } = require('@runsecure/hkdfguard-cache');
+const { AlreadyExistsError, AuthenticationFailedError, configurationPurpose, MAX_WRAPPED_KEY_BYTES, wipe } = require('@runsecure/hkdfguard-abstractions');
+const { EmptyValueError, FilePerSecretCache, ProtectedCache } = require('@runsecure/hkdfguard-cache');
 const { AwsSecretsManagerSecretCache } = require('@runsecure/hkdfguard-cache-awssecretsmanager');
 const { AzureKeyVaultSecretCache } = require('@runsecure/hkdfguard-cache-azurekeyvault');
 const { GoogleSecretManagerSecretCache } = require('@runsecure/hkdfguard-cache-googlesecretmanager');
@@ -30,6 +30,7 @@ const { KeyFileTrust } = require('@runsecure/hkdfguard-securefile');
 
 const RELEASE_FILE = 'release.json';
 const KEY_FILE = 'dek.wrapped';
+const SECRETS_DIR = 'secrets';
 const FORMAT = /^(enc::v\d+::)(.+)$/s;
 const NATIVE = 'native';
 
@@ -75,6 +76,7 @@ async function produce(wrapperName, service, fixtures, dir, cli) {
     const dekSha256 = createHash('sha256').update(raw).digest('hex');
 
     mkdirSync(dir, { recursive: true, mode: 0o700 });
+    writeSecretFiles(pipeline, fixtures, join(dir, SECRETS_DIR));
     const path = join(dir, KEY_FILE);
     if (wrapperName === NATIVE) {
       const wrap = spawnSync(cli, ['wrap', '-kf', path, '-sn', service, '--dek-stdin'], { input: base64 });
@@ -154,11 +156,83 @@ async function consume(wrapperName, service, fixtures, dir) {
     }
 
     await checkCache(checks, new ProtectedCache(ring), fixtures);
+    await checkSecretFiles(checks, ring, fixtures, join(dir, SECRETS_DIR));
   } finally {
     await ring.close();
     await wrapper.close();
   }
   checks.finish(`the ${release.producer} ${release.wrapper} release`);
+}
+
+/** The value a secrets-folder file is written with: its own plaintext, or the named secret's. */
+function filePlaintext(fixtures, file) {
+  if (file.plaintextOf) {
+    const s = fixtures.secrets.find((secret) => secret.identifier === file.plaintextOf);
+    if (s !== undefined) return s.plaintext;
+  }
+  return file.plaintext ?? '';
+}
+
+/**
+ * Writes the release's secrets folder as a pipeline would for FilePerSecretCache: one file per
+ * secret, holding its value encrypted under the pipeline key for the file's own name. On Windows the
+ * folder is created without an owner-only ACL.
+ */
+function writeSecretFiles(pipeline, fixtures, folder) {
+  mkdirSync(folder, process.platform === 'win32' ? { recursive: true } : { recursive: true, mode: 0o700 });
+  const encoder = new TextEncoder();
+  const written = new Map();
+  for (const file of fixtures.files) {
+    let contents;
+    if (file.empty) {
+      contents = Buffer.alloc(0);
+    } else if (file.copyOf) {
+      contents = written.get(file.copyOf);
+      if (contents === undefined) throw new Error(`the file ${file.name} copies ${file.copyOf}, which isn't written before it`);
+    } else {
+      let value;
+      try {
+        value = pipeline.encrypt(encoder.encode(filePlaintext(fixtures, file)), file.name);
+      } catch (error) {
+        throw new Error(`encrypting the file ${file.name}: ${message(error)}`);
+      }
+      contents = Buffer.from(file.trailingNewline ? `${value}\n` : value, 'utf8');
+    }
+    written.set(file.name, contents);
+    writeFileSync(join(folder, file.name), contents, { mode: 0o600 });
+  }
+}
+
+/**
+ * Reads the release's secrets folder through a FilePerSecretCache over the release's ring: each file
+ * reads as its value, is missing, or is refused as its fixture expects, and a name no file can answer
+ * - one that isn't a file name in the folder - is missing. No value is ever printed.
+ */
+async function checkSecretFiles(checks, ring, fixtures, folder) {
+  let files;
+  try {
+    files = new FilePerSecretCache(folder, currentAccountTrust(), ring, new DefaultFormatProvider());
+  } catch (error) {
+    checks.fail(`files: opening the secrets folder: ${message(error)}`);
+    return;
+  }
+  for (const file of fixtures.files) {
+    const { got, error } = await attempt(() => readCache(files, file.name), true);
+    if (file.expect === 'value') {
+      checks.check(error === undefined && got === filePlaintext(fixtures, file),
+        `files: ${file.name} reads as its value: got ${got?.length ?? 0} characters, ${message(error)}`);
+    } else if (file.expect === 'missing') {
+      checks.check(error === undefined && got === '', `files: ${file.name} is missing: got ${got?.length ?? 0} characters, ${message(error)}`);
+    } else if (file.expect === 'refused') {
+      checks.check(error instanceof AuthenticationFailedError, `files: ${file.name} fails authentication: ${message(error)}`);
+    } else {
+      checks.fail(`files: ${file.name} expects ${JSON.stringify(file.expect)}, which isn't value, missing or refused`);
+    }
+  }
+  for (const name of fixtures.missingFiles) {
+    const { got, error } = await attempt(() => readCache(files, name), true);
+    checks.check(error === undefined && got === '', `files: ${name} is missing: got ${got?.length ?? 0} characters, ${message(error)}`);
+  }
 }
 
 /**

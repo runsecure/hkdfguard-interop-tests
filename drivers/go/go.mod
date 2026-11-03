@@ -13,6 +13,7 @@ require (
 	github.com/runsecure/hkdfguard-go v0.9.1
 	github.com/runsecure/hkdfguard-go/cache/awssecretsmanager v0.9.1
 	github.com/runsecure/hkdfguard-go/cache/azurekeyvault v0.9.1
+	github.com/runsecure/hkdfguard-go/cache/filepersecret v0.9.1
 	github.com/runsecure/hkdfguard-go/cache/googlesecretmanager v0.9.1
 	github.com/runsecure/hkdfguard-go/cache/hashicorpvault v0.9.1
 	github.com/runsecure/hkdfguard-go/cryptoprovider/aesgcm256 v0.9.1
@@ -102,6 +103,7 @@ replace (
 	github.com/runsecure/hkdfguard-go => ../../../hkdfguard-go
 	github.com/runsecure/hkdfguard-go/cache/awssecretsmanager => ../../../hkdfguard-go/cache/awssecretsmanager
 	github.com/runsecure/hkdfguard-go/cache/azurekeyvault => ../../../hkdfguard-go/cache/azurekeyvault
+	github.com/runsecure/hkdfguard-go/cache/filepersecret => ../../../hkdfguard-go/cache/filepersecret
 	github.com/runsecure/hkdfguard-go/cache/googlesecretmanager => ../../../hkdfguard-go/cache/googlesecretmanager
 	github.com/runsecure/hkdfguard-go/cache/hashicorpvault => ../../../hkdfguard-go/cache/hashicorpvault
 	github.com/runsecure/hkdfguard-go/cryptoprovider/aesgcm256 => ../../../hkdfguard-go/cryptoprovider/aesgcm256

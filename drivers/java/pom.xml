@@ -141,6 +141,11 @@
     </dependency>
     <dependency>
       <groupId>io.github.runsecure</groupId>
+      <artifactId>hkdfguard-cache-filepersecret</artifactId>
+      <version>${hkdfguard.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>io.github.runsecure</groupId>
       <artifactId>hkdfguard-cache-awssecretsmanager</artifactId>
       <version>${hkdfguard.version}</version>
     </dependency>
