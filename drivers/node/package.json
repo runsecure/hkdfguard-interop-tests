@@ -7,7 +7,7 @@
   "dependencies": {
     "@aws-sdk/client-kms": "3.1149.0",
     "@aws-sdk/client-secrets-manager": "3.1149.0",
-    "@azure/identity": "4.13.3",
+    "@azure/identity": "4.14.1",
     "@google-cloud/kms": "6.3.0",
     "@google-cloud/secret-manager": "7.1.1",
     "@runsecure/hkdfguard-abstractions": "file:../../../hkdfguard-node/packages/abstractions",

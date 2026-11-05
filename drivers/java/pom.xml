@@ -19,12 +19,12 @@
     <!-- The versions hkdfguard-java's parent POM manages, so the driver runs the SDKs the library
          was built and tested with. -->
     <jackson.version>2.22.4</jackson.version>
-    <awssdk.version>2.57.7</awssdk.version>
+    <awssdk.version>2.57.9</awssdk.version>
     <azuresdk.version>1.3.9</azuresdk.version>
     <googlecloud.version>26.91.0</googlecloud.version>
     <opentelemetry.version>1.67.0</opentelemetry.version>
     <slf4j.version>2.0.20</slf4j.version>
-    <guava.version>33.7.2-jre</guava.version>
+    <guava.version>33.8.0-jre</guava.version>
   </properties>
 
   <dependencyManagement>
