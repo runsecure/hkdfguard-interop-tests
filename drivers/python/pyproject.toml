@@ -21,6 +21,8 @@ dependencies = [
     "hkdfguard-cache-azurekeyvault",
     "hkdfguard-cache-googlesecretmanager",
     "hkdfguard-cache-hashicorpvault",
+    "hkdfguard-cache-jsonsecretsfile",
+    "hkdfguard-pipeline",
     # No port distribution depends on it: the driver signs in to Azure with DefaultAzureCredential.
     "azure-identity>=1.25",
 ]
@@ -45,3 +47,5 @@ hkdfguard-cache-awssecretsmanager = { path = "../../../hkdfguard-python/packages
 hkdfguard-cache-azurekeyvault = { path = "../../../hkdfguard-python/packages/hkdfguard-cache-azurekeyvault", editable = true }
 hkdfguard-cache-googlesecretmanager = { path = "../../../hkdfguard-python/packages/hkdfguard-cache-googlesecretmanager", editable = true }
 hkdfguard-cache-hashicorpvault = { path = "../../../hkdfguard-python/packages/hkdfguard-cache-hashicorpvault", editable = true }
+hkdfguard-cache-jsonsecretsfile = { path = "../../../hkdfguard-python/packages/hkdfguard-cache-jsonsecretsfile", editable = true }
+hkdfguard-pipeline = { path = "../../../hkdfguard-python/packages/hkdfguard-pipeline", editable = true }

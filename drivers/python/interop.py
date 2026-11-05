@@ -1,7 +1,8 @@
 """The Python driver for the HkdfGuard interop matrix: it produces a release (pipeline encryption plus a
-key file wrapped by one key wrapper), consumes any driver's release with its own port of the same
-wrapper, and reads a remote secret store through its cache over that release's key ring. See the
-repository README for the contract every driver follows."""
+key file wrapped by one key wrapper, and the secrets pipeline writer's files, JSON and tar archive),
+consumes any driver's release with its own port of the same wrapper and caches, and reads a remote
+secret store through its cache over that release's key ring. See the repository README for the
+contract every driver follows."""
 
 from __future__ import annotations
 
@@ -12,18 +13,23 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import ssl
 import subprocess
 import sys
+from collections.abc import Buffer, MutableMapping, Sequence
 from pathlib import Path
-from typing import Any, Callable
+from typing import IO, Any, Callable
 from urllib.parse import urlsplit
 
-from hkdfguard.abstractions import ArrayUtility, AuthenticationTagMismatchError, KeyWrapper, ProtectedConfigurationPurpose, ProtectedReadOnlyCache, WrappedKeyLimits
+from hkdfguard.abstractions import (ArrayUtility, AuthenticationTagMismatchError, EncryptedFormatProvider, KeyNotFoundError, KeyWrapper,
+                                    PipelineDataProtector, ProtectedConfigurationPurpose, ProtectedReadOnlyCache, WrappedKeyLimits)
 from hkdfguard.cache import FilePerSecretCache, ProtectedCache
+from hkdfguard.cache.jsonsecretsfile import JsonSecretsFileReadOnlyCache
 from hkdfguard.cryptoprovider.aesgcm256 import AesGcmCryptoProviderFactory, AesGcmPipelineDataProtector
 from hkdfguard.dataencryptionkey import DefaultFormatProvider, KeyRing, KeyRingBuilder
 from hkdfguard.keywrapping.v1 import NativeHkdfKeyWrapperV1
+from hkdfguard.pipeline import SecretPipelineWriter, SecretRequest
 from hkdfguard.securefile import KeyFileTrust
 
 RELEASE_FILE = "release.json"
@@ -31,6 +37,17 @@ KEY_FILE = "dek.wrapped"
 SECRETS_DIR = "secrets"
 KEY_SIZE = 32
 FORMAT = re.compile(r"^(enc::v\d+::)(.+)$", re.DOTALL)
+# The base64 of a 32-byte key: 44 ASCII characters, no line ending.
+KEY_BASE64_LENGTH = 44
+
+PIPELINE_DIR = "pipeline"
+JSON_SECRETS_FILE = "secrets.json"
+STREAM_JSON_SECRETS_FILE = "secrets.stream.json"
+EMPTY_JSON_SECRETS_FILE = "secrets.empty.json"
+SECRETS_TAR = "secrets.tar"
+PIPELINE_FILES_DIR = "files"
+PIPELINE_UNPACKED_DIR = "unpacked"
+CONSUMER_DIR = "consumed-by-python"
 
 NATIVE = "native"
 # The context every port's integration tests bind their key files to, so the matrix runs under the
@@ -47,19 +64,17 @@ INTEGER = re.compile(r"^-?[0-9]{1,15}$")
 
 def produce(wrapper_name: str, service: str, fixtures: dict[str, Any], directory: Path, cli: str) -> None:
     """Does what a release pipeline does: encrypts every fixture under a fresh pipeline key, writes the
-    values, and wraps the key into the key file - by handing it to the native tool on standard input,
-    or through a network key wrapper in this process."""
+    values and the secrets pipeline writer's output, and wraps the key into the key file - by having
+    write_dek write it into the native tool's standard input, or through a network key wrapper in
+    this process."""
     pipeline = AesGcmPipelineDataProtector(DefaultFormatProvider(), fixtures["keyVersion"])
     raw = bytearray(KEY_SIZE)
     try:
         values = {s["identifier"]: pipeline.encrypt(s["plaintext"], s["identifier"]) for s in fixtures["secrets"]}
 
+        read_dek_through_write_dek(pipeline, raw)
         # Test only: a hash of the DEK, so every consumer can prove it unwrapped this same key. Never
-        # record anything derived from a DEK beside its key file in a real pipeline. Decoding also
-        # leaves the DEK in an immutable bytes object that can't be zeroed, as every base64 decode in
-        # CPython does; acceptable for a throwaway test key only.
-        key_base64 = pipeline.get_key_as_base64()
-        raw[:] = base64.b64decode(key_base64)
+        # record anything derived from a DEK beside its key file in a real pipeline.
         dek_sha256 = hashlib.sha256(raw).hexdigest()
 
         # The matrix creates the folder, so this is a no-op there. Never with mode 0o700 on Windows:
@@ -67,14 +82,10 @@ def produce(wrapper_name: str, service: str, fixtures: dict[str, Any], directory
         # key file checks refuse.
         directory.mkdir(**({} if os.name == "nt" else {"mode": 0o700}), parents=True, exist_ok=True)
         write_secret_files(pipeline, fixtures, directory / SECRETS_DIR)
+        write_pipeline(pipeline, fixtures["pipeline"], directory)
         path = directory / KEY_FILE
         if wrapper_name == NATIVE:
-            # The protector's own read-only view goes to stdin as it is: no copy of the key is made here.
-            wrap = subprocess.run([cli, "wrap", "-kf", str(path), "-sn", service, "--dek-stdin"],
-                                  input=key_base64, capture_output=True)
-            if wrap.returncode != 0:
-                output = (wrap.stdout + wrap.stderr).decode(errors="replace").strip()
-                raise RuntimeError(f"hkdfguard wrap exited {wrap.returncode}: {output}")
+            wrap_natively(cli, path, service, pipeline)
         else:
             with contextlib.ExitStack() as stack:
                 wrapper = new_wrapper(wrapper_name, service, WRAP_CONTEXT, stack)
@@ -91,10 +102,70 @@ def produce(wrapper_name: str, service: str, fixtures: dict[str, Any], directory
         release_path = directory / RELEASE_FILE
         release_path.write_text(json.dumps(release, ensure_ascii=False, indent=2), encoding="utf-8")
         os.chmod(release_path, 0o600)
-        print(f"OK produced {len(values)} secrets in {directory}")
+        print(f"OK produced {len(values)} secrets and {len(fixtures['pipeline']['secrets'])} pipeline secrets in {directory}")
     finally:
         ArrayUtility.zero_memory(raw)
         pipeline.close()
+
+
+def wrap_natively(cli: str, path: Path, service: str, pipeline: AesGcmPipelineDataProtector) -> None:
+    """Writes the pipeline key with write_dek straight into the standard input of
+    ``hkdfguard wrap --dek-stdin``: never an argument or an environment variable, and never a copy
+    here. The pipe is unbuffered, so no buffer of Popen's holds the key either. Closing its input is
+    what tells the tool the key is complete."""
+    wrap = subprocess.Popen([cli, "wrap", "-kf", str(path), "-sn", service, "--dek-stdin"],
+                            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
+    try:
+        pipeline.write_dek(wrap.stdin)
+    finally:
+        wrap.stdin.close()
+    stdout, stderr = wrap.communicate()
+    if wrap.returncode != 0:
+        output = (stdout + stderr).decode(errors="replace").strip()
+        raise RuntimeError(f"hkdfguard wrap exited {wrap.returncode}: {output}")
+
+
+class _KeyBuffer:
+    """A BinaryDestination over a fixed bytearray, as .NET's MemoryStream over a pinned array: what
+    is written is copied into it in place, and a write past its end is refused."""
+
+    def __init__(self, buffer: bytearray) -> None:
+        self.buffer = buffer
+        self.written = 0
+
+    def write(self, data: Buffer, /) -> int:
+        view = memoryview(data).cast("B")
+        end = self.written + view.nbytes
+        if end > len(self.buffer):
+            raise ValueError(f"write_dek wrote more than {len(self.buffer)} bytes")
+        self.buffer[self.written:end] = view
+        self.written = end
+        return view.nbytes
+
+    def flush(self) -> None:
+        pass
+
+
+def read_dek_through_write_dek(pipeline: AesGcmPipelineDataProtector, dek: bytearray) -> None:
+    """Writes the pipeline key through write_dek, as the wrap tool's --dek-stdin reads it, into a
+    buffer here, and decodes it into ``dek``: so every wrapper's key file comes from those bytes, and
+    every consumer's DEK check proves them. Checks they are exactly the key's 44 base64 characters as
+    ASCII, without a line ending. Decoding leaves the DEK in an immutable bytes object that can't be
+    zeroed, as every base64 decode in CPython does; acceptable for a throwaway test key only."""
+    ascii_key = bytearray(KEY_BASE64_LENGTH + 2)
+    try:
+        destination = _KeyBuffer(ascii_key)
+        pipeline.write_dek(destination)
+        written = destination.written
+        key = pipeline.get_key_as_base64()
+        if written != KEY_BASE64_LENGTH or memoryview(ascii_key)[:written] != key:
+            raise RuntimeError(f"write_dek wrote {written} bytes, not the key's {KEY_BASE64_LENGTH} base64 characters")
+        decoded = base64.b64decode(memoryview(ascii_key)[:written], validate=True)
+        if len(decoded) != KEY_SIZE:
+            raise RuntimeError("The pipeline key isn't 32 bytes.")
+        dek[:] = decoded
+    finally:
+        ArrayUtility.zero_memory(ascii_key)
 
 
 def consume(wrapper_name: str, service: str, fixtures: dict[str, Any], directory: Path) -> bool:
@@ -141,6 +212,7 @@ def consume(wrapper_name: str, service: str, fixtures: dict[str, Any], directory
 
         check_cache(checks, ProtectedCache(ring), fixtures)
         check_secret_files(checks, ring, fixtures, directory / SECRETS_DIR)
+        check_pipeline(checks, ring, fixtures["pipeline"], directory)
         return checks.finish(f"the {release['producer']} {release['wrapper']} release")
 
 
@@ -208,6 +280,248 @@ def check_secret_files(checks: Checker, ring: KeyRing, fixtures: dict[str, Any],
     for name in fixtures["missingFiles"]:
         got, error = attempt(lambda: read_cache(files, name))
         checks.check(error is None and got == "", f"files: {name} is missing: got {size(got)} bytes, {error}")
+
+
+# The secrets pipeline half of a release: every fixture in the fixtures' pipeline section is pulled
+# through the port's real SecretPipelineWriter base, over an in-memory store, and written in each of
+# the writer's layouts to D/pipeline. A consumer reads them back with its own port's caches over the
+# release's key ring. See the README's driver contract.
+
+STORE_NAME = re.compile(r"[A-Za-z0-9/_.\-]+")
+
+
+class InMemorySecretPipelineWriter(SecretPipelineWriter):
+    """A SecretPipelineWriter over an in-memory store: each store name maps to its value's exact
+    text, handed to the writer as UTF-8 in a bytearray zeroed after. Names match exactly, and a store
+    name is 1 or more ASCII letters, digits, '/', '_', '.' and '-'. There is no default key."""
+
+    def __init__(self, protector: PipelineDataProtector, secret_names: Sequence[str], store: dict[str, str]) -> None:
+        self._store = store
+        super().__init__(protector, secret_names, lambda name: STORE_NAME.fullmatch(name) is not None)
+
+    def _read_secret(self, name: str, requests: Sequence[SecretRequest], values: MutableMapping[str, str]) -> None:
+        text = self._store.get(name)
+        if text is not None:
+            # The fixture's text is already an immutable str; only this copy of its bytes is the writer's.
+            secret = bytearray(text, "utf-8")
+            try:
+                self._protect_secret(secret, requests, values)
+            finally:
+                ArrayUtility.zero_memory(secret)
+
+
+def write_pipeline(pipeline: AesGcmPipelineDataProtector, fixtures: dict[str, Any], directory: Path) -> None:
+    """Writes the release's pipeline folder. The writers use the release's own pipeline protector, so
+    every value decrypts under the release's key ring, and they never close it."""
+    store: dict[str, str] = fixtures["store"]
+    secrets: list[dict[str, Any]] = fixtures["secrets"]
+    for s in secrets:
+        if SecretPipelineWriter.get_file_name(s["name"]) != s["fileName"]:
+            raise RuntimeError(f"pipeline: {s['name']}'s file name isn't {s['fileName']}")
+    for names in fixtures["refused"]:
+        try:
+            InMemorySecretPipelineWriter(pipeline, names, store).close()
+        except ValueError:
+            continue
+        raise RuntimeError(f"pipeline: the writer accepted [{', '.join(names)}]")
+
+    folder = directory / PIPELINE_DIR
+    # Never with mode 0o700 on Windows, as for the release's folder.
+    folder.mkdir(**({} if os.name == "nt" else {"mode": 0o700}), parents=True, exist_ok=True)
+    file_names = [s["fileName"] for s in secrets]
+    with InMemorySecretPipelineWriter(pipeline, [s["name"] for s in secrets], store) as writer:
+        writer.pull_secrets()
+        if sorted(writer.protected_secrets) != sorted(file_names):
+            raise RuntimeError("pipeline: the writer's protected secrets aren't the fixtures' file names")
+
+        writer.write_json_secrets(folder / JSON_SECRETS_FILE)
+        with open(folder / STREAM_JSON_SECRETS_FILE, "wb") as stream:
+            writer.write_json_secrets_to_stream(stream)
+        writer.write_protected_secret_files(folder / PIPELINE_FILES_DIR)
+        with open(folder / SECRETS_TAR, "wb") as stream:
+            writer.write_protected_secret_files_to_stream(stream)
+
+        # As a deployment would: the archive straight into a tar process's standard input.
+        unpacked = folder / PIPELINE_UNPACKED_DIR
+        unpacked.mkdir(**({} if os.name == "nt" else {"mode": 0o700}), exist_ok=True)
+        untar(unpacked, writer.write_protected_secret_files_to_stream)
+        difference = compare_folders(folder / PIPELINE_FILES_DIR, unpacked, file_names)
+        if difference is not None:
+            raise RuntimeError(f"pipeline: the archive piped to tar unpacked differently: {difference}")
+
+    with InMemorySecretPipelineWriter(pipeline, fixtures["missing"], store) as missing:
+        try:
+            missing.pull_secrets()
+        except KeyNotFoundError:
+            pass
+        else:
+            raise RuntimeError("pipeline: pulling secrets the store holds no value for succeeded")
+        if len(missing.protected_secrets) != 0:
+            raise RuntimeError(f"pipeline: pulling only missing secrets kept {len(missing.protected_secrets)}")
+        missing.write_json_secrets(folder / EMPTY_JSON_SECRETS_FILE)
+
+
+def check_pipeline(checks: Checker, ring: KeyRing, fixtures: dict[str, Any], directory: Path) -> None:
+    """Reads the release's pipeline folder as a deployed application would: secrets.json through a
+    JsonSecretsFileReadOnlyCache over the release's ring, tampered copies of it refused whole, and
+    secrets.tar unpacked by the system tar and read through a FilePerSecretCache."""
+    folder = directory / PIPELINE_DIR
+    trust = key_file_trust()
+    format_provider = DefaultFormatProvider()
+    json_path = folder / JSON_SECRETS_FILE
+    secrets: list[dict[str, Any]] = fixtures["secrets"]
+
+    cache, error = attempt(lambda: JsonSecretsFileReadOnlyCache(json_path, trust, ring, format_provider))
+    if error is not None:
+        checks.fail(f"pipeline: opening {JSON_SECRETS_FILE}: {error}")
+    else:
+        for s in secrets:
+            for name in [s["fileName"], *s.get("alsoReadAs", [])]:
+                got, error = attempt(lambda: read_cache(cache, name))
+                checks.check(error is None and got == s["plaintext"],
+                             f"pipeline: {JSON_SECRETS_FILE} reads {s['name']} as {name}: got {size(got)} bytes, {error or 'wrong plaintext'}")
+        for name in [*fixtures["missingLookups"], *fixtures["invalidLookups"]]:
+            got, error = attempt(lambda: read_cache(cache, name))
+            checks.check(error is None and got == "", f"pipeline: {JSON_SECRETS_FILE} has no {name}: got {size(got)} bytes, {error}")
+
+    same, error = attempt(lambda: (folder / STREAM_JSON_SECRETS_FILE).read_bytes() == json_path.read_bytes())
+    checks.check(error is None and same, f"pipeline: {STREAM_JSON_SECRETS_FILE} is {JSON_SECRETS_FILE} byte for byte: {error or 'it differs'}")
+
+    empty_path = folder / EMPTY_JSON_SECRETS_FILE
+    empty, error = attempt(lambda: empty_path.read_bytes() == b"{}")
+    checks.check(error is None and empty, f"pipeline: {EMPTY_JSON_SECRETS_FILE} is {{}}: {error or 'it is not'}")
+    first = secrets[0]["fileName"]
+    nothing, error = read_from_new_cache(empty_path, trust, ring, format_provider, first)
+    checks.check(error is None and nothing == "", f"pipeline: {EMPTY_JSON_SECRETS_FILE} has no {first}: got {size(nothing)} bytes, {describe(error)}")
+
+    work = folder / CONSUMER_DIR
+    if work.exists():
+        shutil.rmtree(work)
+    # Never with mode 0o700 on Windows, as for the release's folder.
+    work.mkdir(**({} if os.name == "nt" else {"mode": 0o700}), parents=True)
+    check_tampered(checks, ring, format_provider, trust, json_path, work)
+    check_archive(checks, ring, fixtures, trust, folder, work)
+
+
+def check_tampered(checks: Checker, ring: KeyRing, format_provider: EncryptedFormatProvider, trust: KeyFileTrust, json_path: Path, work: Path) -> None:
+    """Two copies of secrets.json, each changed one way, must each be refused whole: a lookup of a
+    member the change didn't touch fails authentication too."""
+    try:
+        members = json.loads(json_path.read_bytes().decode("utf-8"), object_pairs_hook=list)
+        if not isinstance(members, list) or not all(isinstance(value, str) for _, value in members):
+            raise ValueError("it isn't an object of strings")
+    except Exception as error:  # noqa: BLE001 - reported as the check's failure
+        checks.fail(f"pipeline: parsing {JSON_SECRETS_FILE} to tamper with it: {describe(error)}")
+        return
+    if len(members) < 3:
+        checks.fail(f"pipeline: {JSON_SECRETS_FILE} holds {len(members)} members, too few to tamper with")
+        return
+    untouched = members[-1][0]
+
+    swapped = list(members)
+    swapped[0], swapped[1] = (members[0][0], members[1][1]), (members[1][0], members[0][1])
+    got, error = read_from_new_cache(write_members(work / "swapped.json", swapped), trust, ring, format_provider, untouched)
+    checks.check(isinstance(error, AuthenticationTagMismatchError),
+                 f"pipeline: {JSON_SECRETS_FILE} with two values swapped is refused whole: got {size(got)} bytes, {describe(error)}")
+
+    tampered, tamper_error = attempt(lambda: tamper(members[0][1]))
+    if tamper_error is not None:
+        checks.fail(f"pipeline: tampering {members[0][0]}: {tamper_error}")
+        return
+    flipped = list(members)
+    flipped[0] = (members[0][0], tampered)
+    got, error = read_from_new_cache(write_members(work / "flipped.json", flipped), trust, ring, format_provider, untouched)
+    checks.check(isinstance(error, AuthenticationTagMismatchError),
+                 f"pipeline: {JSON_SECRETS_FILE} with a flipped tag bit is refused whole: got {size(got)} bytes, {describe(error)}")
+
+
+def check_archive(checks: Checker, ring: KeyRing, fixtures: dict[str, Any], trust: KeyFileTrust, folder: Path, work: Path) -> None:
+    """Unpacks secrets.tar with the system tar, from its standard input, into a fresh folder: it must
+    hold exactly the files write_protected_secret_files wrote, byte for byte, each reading through a
+    FilePerSecretCache as its value."""
+    unpacked = work / PIPELINE_UNPACKED_DIR
+    try:
+        unpacked.mkdir(**({} if os.name == "nt" else {"mode": 0o700}))
+        with open(folder / SECRETS_TAR, "rb") as archive:
+            untar(unpacked, lambda destination: shutil.copyfileobj(archive, destination))
+    except Exception as error:  # noqa: BLE001 - reported as the check's failure
+        checks.fail(f"pipeline: unpacking {SECRETS_TAR}: {describe(error)}")
+        return
+
+    names = [s["fileName"] for s in fixtures["secrets"]]
+    entries = sorted(os.listdir(unpacked))
+    checks.check(entries == sorted(names), f"pipeline: {SECRETS_TAR} holds exactly the secrets' files: it holds {len(entries)}, not {len(names)}")
+
+    files, error = attempt(lambda: FilePerSecretCache(unpacked, trust, ring, DefaultFormatProvider()))
+    if error is not None:
+        checks.fail(f"pipeline: opening the unpacked folder: {error}")
+        return
+    for s in fixtures["secrets"]:
+        difference = compare_folders(folder / PIPELINE_FILES_DIR, unpacked, [s["fileName"]])
+        got, error = attempt(lambda: read_cache(files, s["fileName"]))
+        why = difference or f"got {size(got)} bytes, {error or 'wrong plaintext'}"
+        checks.check(difference is None and error is None and got == s["plaintext"],
+                     f"pipeline: {SECRETS_TAR}'s {s['fileName']} is the written file and reads as its value: {why}")
+
+
+def tar_path() -> str:
+    """The system tar: Windows' own bsdtar, else the tar on PATH."""
+    if os.name == "nt":
+        return str(Path(os.environ.get("SYSTEMROOT", r"C:\Windows")) / "System32" / "tar.exe")
+    return "tar"
+
+
+def untar(folder: Path, write: Callable[[IO[bytes]], object]) -> None:
+    """Runs the system tar, with its arguments in a list and no shell, to unpack an archive from its
+    standard input into ``folder``: ``write`` writes the archive, and the input is closed afterwards.
+    The archive holds only encrypted values, so Popen's buffered pipe is fine here."""
+    tar = subprocess.Popen([tar_path(), "-x", "--no-same-owner", "-f", "-", "-C", str(folder)],
+                           stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        write(tar.stdin)
+    finally:
+        try:
+            tar.stdin.close()
+        finally:
+            stdout, stderr = tar.communicate()
+    if tar.returncode != 0:
+        raise RuntimeError(f"tar exited {tar.returncode}: {(stdout + stderr).decode(errors='replace').strip()}")
+
+
+def compare_folders(expected: Path, actual: Path, names: list[str]) -> str | None:
+    """None if each named file in ``actual`` is the one in ``expected`` byte for byte, else what differs."""
+    for name in names:
+        path = actual / name
+        if not path.is_file():
+            return f"{name} is missing"
+        try:
+            if path.read_bytes() != (expected / name).read_bytes():
+                return f"{name} differs"
+        except OSError as error:
+            return f"{name}: {describe(error)}"
+    return None
+
+
+def read_from_new_cache(path: Path, trust: KeyFileTrust, ring: KeyRing, format_provider: EncryptedFormatProvider,
+                        name: str) -> tuple[str | None, Exception | None]:
+    """A lookup through a new JsonSecretsFileReadOnlyCache over ``path``, so nothing an earlier cache
+    loaded is reused: what it read, or the exception it raised."""
+    try:
+        return read_cache(JsonSecretsFileReadOnlyCache(path, trust, ring, format_provider), name), None
+    except Exception as error:  # noqa: BLE001 - any failure is the answer being checked
+        return None, error
+
+
+def write_members(path: Path, members: list[tuple[str, str]]) -> Path:
+    """Writes ``members`` as a JSON object, in their order. The layout is this driver's own: the cache
+    reads any valid JSON object."""
+    lines = [f"  {json.dumps(name, ensure_ascii=False)}: {json.dumps(value, ensure_ascii=False)}" for name, value in members]
+    path.write_bytes(("{\n" + ",\n".join(lines) + "\n}").encode("utf-8"))
+    return path
+
+
+def describe(error: BaseException | None) -> str | None:
+    return None if error is None else f"{type(error).__name__}: {error}"
 
 
 def open_release(wrapper_name: str, service: str, directory: Path, stack: contextlib.ExitStack) -> tuple[dict[str, Any], KeyWrapper, KeyRing]:

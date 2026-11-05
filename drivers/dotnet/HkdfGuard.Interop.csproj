@@ -34,10 +34,12 @@
     <ProjectReference Include="..\..\..\hkdfguard-dotnet\src\HkdfGuard.KeyWrapping.GoogleKms\HkdfGuard.KeyWrapping.GoogleKms.csproj" />
     <ProjectReference Include="..\..\..\hkdfguard-dotnet\src\HkdfGuard.KeyWrapping.HashiCorpVault\HkdfGuard.KeyWrapping.HashiCorpVault.csproj" />
     <ProjectReference Include="..\..\..\hkdfguard-dotnet\src\HkdfGuard.Cache\HkdfGuard.Cache.csproj" />
+    <ProjectReference Include="..\..\..\hkdfguard-dotnet\src\HkdfGuard.Cache.JsonSecretsFile\HkdfGuard.Cache.JsonSecretsFile.csproj" />
     <ProjectReference Include="..\..\..\hkdfguard-dotnet\src\HkdfGuard.Cache.AwsSecretsManager\HkdfGuard.Cache.AwsSecretsManager.csproj" />
     <ProjectReference Include="..\..\..\hkdfguard-dotnet\src\HkdfGuard.Cache.AzureKeyVault\HkdfGuard.Cache.AzureKeyVault.csproj" />
     <ProjectReference Include="..\..\..\hkdfguard-dotnet\src\HkdfGuard.Cache.GoogleSecretManager\HkdfGuard.Cache.GoogleSecretManager.csproj" />
     <ProjectReference Include="..\..\..\hkdfguard-dotnet\src\HkdfGuard.Cache.HashiCorpVault\HkdfGuard.Cache.HashiCorpVault.csproj" />
+    <ProjectReference Include="..\..\..\hkdfguard-dotnet\src\HkdfGuard.Pipeline\HkdfGuard.Pipeline.csproj" />
   </ItemGroup>
 
   <ItemGroup>

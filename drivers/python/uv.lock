@@ -637,6 +637,25 @@ requires-dist = [
 ]
 
 [[package]]
+name = "hkdfguard-cache-jsonsecretsfile"
+version = "0.9.1"
+source = { editable = "../../../hkdfguard-python/packages/hkdfguard-cache-jsonsecretsfile" }
+dependencies = [
+    { name = "hkdfguard-abstractions" },
+    { name = "hkdfguard-cache" },
+    { name = "hkdfguard-diagnostics" },
+    { name = "hkdfguard-securefile" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "hkdfguard-abstractions", editable = "../../../hkdfguard-python/packages/hkdfguard-abstractions" },
+    { name = "hkdfguard-cache", editable = "../../../hkdfguard-python/packages/hkdfguard-cache" },
+    { name = "hkdfguard-diagnostics", editable = "../../../hkdfguard-python/packages/hkdfguard-diagnostics" },
+    { name = "hkdfguard-securefile", editable = "../../../hkdfguard-python/packages/hkdfguard-securefile" },
+]
+
+[[package]]
 name = "hkdfguard-cryptoprovider-aesgcm256"
 version = "0.9.1"
 source = { editable = "../../../hkdfguard-python/packages/hkdfguard-cryptoprovider-aesgcm256" }
@@ -700,6 +719,7 @@ dependencies = [
     { name = "hkdfguard-cache-azurekeyvault" },
     { name = "hkdfguard-cache-googlesecretmanager" },
     { name = "hkdfguard-cache-hashicorpvault" },
+    { name = "hkdfguard-cache-jsonsecretsfile" },
     { name = "hkdfguard-cryptoprovider-aesgcm256" },
     { name = "hkdfguard-dataencryptionkey" },
     { name = "hkdfguard-integration-hashicorpvault" },
@@ -708,6 +728,7 @@ dependencies = [
     { name = "hkdfguard-keywrapping-googlekms" },
     { name = "hkdfguard-keywrapping-hashicorpvault" },
     { name = "hkdfguard-keywrapping-v1" },
+    { name = "hkdfguard-pipeline" },
     { name = "hkdfguard-securefile" },
 ]
 
@@ -720,6 +741,7 @@ requires-dist = [
     { name = "hkdfguard-cache-azurekeyvault", editable = "../../../hkdfguard-python/packages/hkdfguard-cache-azurekeyvault" },
     { name = "hkdfguard-cache-googlesecretmanager", editable = "../../../hkdfguard-python/packages/hkdfguard-cache-googlesecretmanager" },
     { name = "hkdfguard-cache-hashicorpvault", editable = "../../../hkdfguard-python/packages/hkdfguard-cache-hashicorpvault" },
+    { name = "hkdfguard-cache-jsonsecretsfile", editable = "../../../hkdfguard-python/packages/hkdfguard-cache-jsonsecretsfile" },
     { name = "hkdfguard-cryptoprovider-aesgcm256", editable = "../../../hkdfguard-python/packages/hkdfguard-cryptoprovider-aesgcm256" },
     { name = "hkdfguard-dataencryptionkey", editable = "../../../hkdfguard-python/packages/hkdfguard-dataencryptionkey" },
     { name = "hkdfguard-integration-hashicorpvault", editable = "../../../hkdfguard-python/packages/hkdfguard-integration-hashicorpvault" },
@@ -728,6 +750,7 @@ requires-dist = [
     { name = "hkdfguard-keywrapping-googlekms", editable = "../../../hkdfguard-python/packages/hkdfguard-keywrapping-googlekms" },
     { name = "hkdfguard-keywrapping-hashicorpvault", editable = "../../../hkdfguard-python/packages/hkdfguard-keywrapping-hashicorpvault" },
     { name = "hkdfguard-keywrapping-v1", editable = "../../../hkdfguard-python/packages/hkdfguard-keywrapping-v1" },
+    { name = "hkdfguard-pipeline", editable = "../../../hkdfguard-python/packages/hkdfguard-pipeline" },
     { name = "hkdfguard-securefile", editable = "../../../hkdfguard-python/packages/hkdfguard-securefile" },
 ]
 
@@ -812,6 +835,21 @@ dependencies = [
 requires-dist = [
     { name = "cryptography", specifier = ">=45" },
     { name = "hkdfguard-abstractions", editable = "../../../hkdfguard-python/packages/hkdfguard-abstractions" },
+]
+
+[[package]]
+name = "hkdfguard-pipeline"
+version = "0.9.1"
+source = { editable = "../../../hkdfguard-python/packages/hkdfguard-pipeline" }
+dependencies = [
+    { name = "hkdfguard-abstractions" },
+    { name = "hkdfguard-cache" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "hkdfguard-abstractions", editable = "../../../hkdfguard-python/packages/hkdfguard-abstractions" },
+    { name = "hkdfguard-cache", editable = "../../../hkdfguard-python/packages/hkdfguard-cache" },
 ]
 
 [[package]]

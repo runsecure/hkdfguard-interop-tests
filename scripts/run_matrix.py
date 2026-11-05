@@ -3,8 +3,9 @@
 release (pipeline-encrypted secrets plus a key file wrapped by one key wrapper), then has every
 consumer read every release with its own port of the same wrapper. Each consumer also reads each
 configured remote secret store through its own port of that store's cache. Prints a producer x
-consumer grid per wrapper, a store x consumer grid for the caches, and exits non-zero if any cell
-fails.
+consumer grid per wrapper, a wrapper x producer grid checking that every producer lays out its secrets
+pipeline JSON byte for byte as the .NET port does, a store x consumer grid for the caches, and exits
+non-zero if any cell fails.
 
 Standard library only, so it runs before any driver's dependencies are installed:
 
@@ -21,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import json
 import os
 import re
 import shutil
@@ -59,6 +61,11 @@ CACHES: dict[str, list[str]] = {
     "googlesecretmanager": ["HKDFGUARD_TEST_GOOGLE_SECRET_NAME", "HKDFGUARD_TEST_GOOGLE_SECRET_JSON"],
     "hashicorpvault": ["HKDFGUARD_TEST_VAULT_SECRET_NAME", "HKDFGUARD_TEST_VAULT_SECRET_JSON", "HKDFGUARD_TEST_VAULT_TOKEN"],
 }
+
+
+# A value in a producer's secrets pipeline JSON, masked before its layout is compared, since every
+# producer's ciphertext differs.
+ENCRYPTED_VALUE = re.compile(r'"(enc::v[0-9]+::)[A-Za-z0-9+/]*=*"')
 
 
 @dataclass
@@ -219,6 +226,47 @@ def grid(corner: str, rows: list[str], consumers: list[str], cells: dict[tuple[s
     return "\n".join([header, rule, *lines])
 
 
+def expected_pipeline_json(fixtures: dict) -> dict[str, str]:
+    """Each pipeline JSON file as every producer must write it, its values masked: laid out as .NET's
+    Utf8JsonWriter writes it indented with relaxed escaping. That is one member per line, in ordinal
+    file-name order, indented two spaces, a space after each colon, lines ended as the platform ends
+    them (CRLF on Windows), no line ending after the closing brace, no byte order mark, and {} for no
+    secrets."""
+    version = f"enc::v{fixtures['keyVersion']}::"
+    names = sorted(s["fileName"] for s in fixtures["pipeline"]["secrets"])  # ASCII names: code point order is ordinal
+    members = [f'  "{name}": "{version}<base64>"' for name in names]
+    full = "{" + os.linesep + ("," + os.linesep).join(members) + os.linesep + "}"
+    return {"secrets.json": full, "secrets.stream.json": full, "secrets.empty.json": "{}"}
+
+
+def check_pipeline_json(directory: Path, expected: dict[str, str]) -> Cell:
+    """Whether a producer's pipeline JSON files are laid out byte for byte as expected. Only masked
+    text is ever reported: the values are ciphertext, but none of it is needed to say what differs."""
+    problems = []
+    for name, want in expected.items():
+        try:
+            got = ENCRYPTED_VALUE.sub(r'"\1<base64>"', (directory / "pipeline" / name).read_bytes().decode("utf-8"))
+        except (OSError, UnicodeDecodeError) as e:
+            problems.append(f"{name}: {type(e).__name__}: {e}")
+            continue
+        if got != want:
+            # Split on LF only, so a CR where there should be none, or none where there should be one,
+            # shows in the line reported.
+            wanted, lines = want.split("\n"), got.split("\n")
+            line = next((i for i, (a, b) in enumerate(zip(wanted, lines)) if a != b), min(len(wanted), len(lines)))
+            problems.append(f"{name} differs at line {line + 1}: expected {wanted[line] if line < len(wanted) else '<end>'!r}, "
+                            f"got {lines[line] if line < len(lines) else '<end>'!r}")
+    return Cell(not problems, "OK" if not problems else f"FAIL {problems[0]}", "\n".join(problems))
+
+
+def system_tar_present() -> bool:
+    """Whether the tar every driver unpacks the pipeline's archive with is here: Windows' own bsdtar,
+    else the tar on PATH."""
+    if WINDOWS:
+        return Path(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "tar.exe").is_file()
+    return shutil.which("tar") is not None
+
+
 def selected(requested: str | None, known: dict[str, list[str]], env: dict[str, str], what: str,
              parser: argparse.ArgumentParser) -> tuple[list[str], list[str]]:
     """The wrappers or caches to run, and a note for each configured-out one. Named explicitly, a
@@ -274,6 +322,9 @@ def main() -> int:
         parser.error(f"the native hkdfguard tool is not at {args.cli}; pass --cli or set HKDFGUARD_CLI, or leave native out of --wrappers")
     if not wrappers:
         parser.error("no key wrapper to run")
+    if not system_tar_present():
+        parser.error("the system tar is missing: every driver unpacks the secrets pipeline's archive with it")
+    expected_json = expected_pipeline_json(json.loads(FIXTURES.read_text(encoding="utf-8")))
     for note in skipped + skipped_caches:
         print(note, flush=True)
 
@@ -283,6 +334,7 @@ def main() -> int:
     work = work_directory()
     print(f"service {args.service}, releases in {work}", flush=True)
     cells: dict[str, dict[tuple[str, str], Cell]] = {w: {} for w in wrappers}
+    layout_cells: dict[tuple[str, str], Cell] = {}  # (wrapper, producer): its pipeline JSON's layout
     cache_cells: dict[tuple[str, str], Cell] = {}
     failures: list[str] = []
     readable: dict[str, Path] = {}  # per consumer, a release it read, to build its cache's key ring over
@@ -297,6 +349,10 @@ def main() -> int:
                 if not made.ok:
                     failures.append(f"### produce {w} {p}\n{made.output}")
                     continue
+                layout = layout_cells[w, p] = check_pipeline_json(directory, expected_json)
+                print(f"  pipeline JSON {w} {p}: {layout.summary}", flush=True)
+                if not layout.ok:
+                    failures.append(f"### pipeline JSON written by {p} for {w}\n{layout.output}")
                 for c in consumers:
                     cell = cells[w][p, c] = invoke(c, ["consume", "--wrapper", w, "--service", args.service,
                                                         "--fixtures", str(FIXTURES), "--dir", str(directory)], env)
@@ -322,10 +378,11 @@ def main() -> int:
             shutil.rmtree(work, ignore_errors=True)
 
     tables = [f"#### {w}\n\n" + grid("producer \\ consumer", producers, consumers, cells[w]) for w in wrappers]
+    tables.append("#### pipeline JSON layout\n\n" + grid("wrapper \\ producer", wrappers, producers, layout_cells))
     if caches:
         tables.append("#### remote caches\n\n" + grid("store \\ consumer", caches, consumers, cache_cells))
     report = "\n\n".join(tables)
-    count = sum(len(c) for c in cells.values()) + len(cache_cells)
+    count = sum(len(c) for c in cells.values()) + len(layout_cells) + len(cache_cells)
     print(f"\n{report}\n\n{count} cells in {time.monotonic() - started:.0f}s")
     for note in skipped + skipped_caches:
         print(note)

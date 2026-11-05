@@ -1,8 +1,9 @@
 # hkdfguard-interop-tests
 
 Cross-language tests for HkdfGuard. A release written by one port must be readable by every other
-port. A release is a set of pipeline-encrypted secrets plus the key file holding their DEK, wrapped
-by one of five key wrappers:
+port. A release is a set of pipeline-encrypted secrets, the files and archive the port's secrets
+pipeline writer makes of them, and the key file holding their DEK, wrapped by one of five key
+wrappers:
 
 | Wrapper | KEK | Key file written by |
 | --- | --- | --- |
@@ -15,7 +16,10 @@ by one of five key wrappers:
 Each port's own repository already tests its pipeline, its wrappers and its caches in that one
 language. This repository tests what no single port can: that a key file any port wraps under a
 network KEK, with the same context, unwraps in every other port (the ports promise byte-for-byte
-identical formats), and that every port's caches agree on the same names, values and refusals.
+identical formats), and that every port's caches agree on the same names, values and refusals. It
+also tests that every port's secrets pipeline writer names, encrypts and lays out its output exactly
+as the others do, so a deployment can switch the language its pipeline runs in without changing the
+application that reads the secrets.
 
 ```
 producer (dotnet | go | java | node | python)   consumer (dotnet | go | java | node | python)
@@ -24,10 +28,16 @@ pipeline protector generates a 32-byte DEK
 encrypts every fixture -> release.json    ───>  builds a KeyRing over its own port of the wrapper
 encrypts each file fixture for its name         reveals every value under its configuration purpose
   -> secrets/<name>, one file per secret        runs the negative checks
-wraps the DEK -> dek.wrapped                    unwraps dek.wrapped, compares the DEK's hash
-  native: hkdfguard wrap --dek-stdin            refuses dek.wrapped under another context
-  others: the port's wrapper, in process        caches every value in a ProtectedCache over the ring
-                                                reads secrets/ through a FilePerSecretCache over it
+pulls the pipeline fixtures through the         unwraps dek.wrapped, compares the DEK's hash
+  port's SecretPipelineWriter, over an          refuses dek.wrapped under another context
+  in-memory store, with the same protector      caches every value in a ProtectedCache over the ring
+  -> pipeline/secrets.json and its stream       reads secrets/ through a FilePerSecretCache over it
+     copy, secrets.empty.json, files/,          reads pipeline/secrets.json through a
+     secrets.tar, unpacked/ (piped to tar)        JsonSecretsFileReadOnlyCache over it
+wraps the DEK -> dek.wrapped                    refuses tampered copies of secrets.json whole
+  native: WriteDek into the stdin of            unpacks secrets.tar with the system tar and reads
+    hkdfguard wrap --dek-stdin                    it through a FilePerSecretCache
+  others: the port's wrapper, in process
                                          ───>  cache: reads each remote secret store through its
                                                 own port of that store's cache, over the same ring
 ```
@@ -43,7 +53,9 @@ HkdfGuard/
 ```
 
 Toolchains: .NET 10 SDK, Go (the version in `drivers/go/go.mod`), JDK 25 or later, Node 22 or later,
-and [uv](https://docs.astral.sh/uv/). Then:
+and [uv](https://docs.astral.sh/uv/). The drivers also unpack the pipeline's tar archive with the
+system tar: Windows' own `%SystemRoot%\System32\tar.exe`, and GNU tar or bsdtar on `PATH` elsewhere.
+Then:
 
 ```sh
 python scripts/run_matrix.py                 # build every driver, then every configured wrapper and cache
@@ -53,8 +65,10 @@ python scripts/run_matrix.py --wrappers native,awskms --caches ''
 python scripts/run_matrix.py --keep          # keep the releases folder to inspect
 ```
 
-The script prints a producer × consumer grid for each wrapper and a store × consumer grid for the
-remote caches, and exits 1 if any cell fails, with each failing driver's output after the grids:
+The script prints a producer × consumer grid for each wrapper, a wrapper × producer grid for the
+layout of each producer's pipeline JSON (see [The secrets pipeline](#the-secrets-pipeline)), and a
+store × consumer grid for the remote caches. It exits 1 if any cell fails, with each failing driver's
+output after the grids:
 
 ```
 #### awskms
@@ -63,6 +77,14 @@ remote caches, and exits 1 if any cell fails, with each failing driver's output 
 | --- | :---: | :---: | :---: | :---: | :---: |
 | dotnet | pass | pass | pass | pass | pass |
 | go | pass | pass | pass | pass | pass |
+| ...
+
+#### pipeline JSON layout
+
+| wrapper \ producer | dotnet | go | java | node | python |
+| --- | :---: | :---: | :---: | :---: | :---: |
+| native | pass | pass | pass | pass | pass |
+| awskms | pass | pass | pass | pass | pass |
 | ...
 
 #### remote caches
@@ -149,8 +171,9 @@ folder is removed afterwards unless you pass `--keep`.
 
 ## What each consumer checks
 
-Every secret in [fixtures/secrets.json](fixtures/secrets.json) is checked, 33 checks per native
-release and 34 per network one:
+Every secret in [fixtures/secrets.json](fixtures/secrets.json) is checked, 72 checks per native
+release and 73 per network one: 33 (or 34) over the release's values, key file, caches and
+`secrets/` folder, as below, then 39 over its secrets pipeline, as the next section describes.
 
 - Each value decrypts to its fixture's plaintext under its key's configuration purpose. That
   includes an empty value, non-ASCII text and emoji, and a 3,000-byte value close to the
@@ -167,7 +190,7 @@ release and 34 per network one:
   reads under its identifier and its `alsoReadAs` names (the cache ignores ASCII case), and is
   missing under its `mustNotReadAs` names. The empty value is refused, since a cache reports a
   missing name as 0 bytes, and adding a value again under another ASCII case is refused.
-- Last, the release's `secrets/` folder is read through a `FilePerSecretCache` over the same ring,
+- Then the release's `secrets/` folder is read through a `FilePerSecretCache` over the same ring,
   trusting the consumer's own account as the network wrappers do. Each file in the fixtures' `files`
   must be what its `expect` says. `value`: a file encrypted for its own name reads as its plaintext,
   including one with a trailing newline, non-ASCII text, and the 3,000-byte value. `missing`: an
@@ -180,6 +203,55 @@ release and 34 per network one:
 key file: a hash lets anyone holding the file confirm a guessed or leaked key, and it tells an
 attacker which key a stolen copy belongs to. It's acceptable here only because each run's DEK is
 random, used once, and deleted with the releases folder.
+
+### The secrets pipeline
+
+The fixtures' `pipeline` section is a secret store's contents and the names a pipeline pulls from
+it. Each producer runs them through its port's real `SecretPipelineWriter` base, subclassed over an
+in-memory store, and with the same pipeline protector as the release. So the release's key ring
+reads every value it writes. The store holds whole-value secrets and a JSON object read by
+`name#key`: one key a string with JSON escapes, one with non-ASCII text, and an integer, a decimal
+and `true`, which are read as their JSON text. A nested object holds keys of the same names, which
+must never be read. Store names and keys come in pairs that differ only in ASCII case (`Prod/Db` and
+`prod/db`, `#Password` and `#password`). Each value is bound to its file name, its name with every `/`
+and `#` made `__`.
+
+Each consumer then reads the producer's `pipeline` folder (39 checks):
+
+- `secrets.json`, read through a `JsonSecretsFileReadOnlyCache` over the release's key ring: every
+  value reads under its file name and, since the cache ignores ASCII case, under each `alsoReadAs`
+  name. `prod__db` reads `Prod/Db`'s value: only one of the pair was pulled.
+- Names the file doesn't hold are missing (`missingLookups`). So is each name that can't be a
+  secret's (`invalidLookups`): a store name with `/` and `#`, `../secrets.json`, `.hidden`, a
+  trailing space, and `prod__apı-key`, whose dotless `ı` folds onto `I` when case is ignored and must
+  never match `prod__api-key`.
+- `secrets.stream.json`, written to a stream, is `secrets.json` byte for byte.
+- `secrets.empty.json`, from a pull that found none of the secrets it named, is exactly `{}`, and
+  reads as holding nothing.
+- Two copies of `secrets.json`, one with two values swapped and one with a flipped GCM tag bit, are
+  each refused whole. A lookup of a member neither change touched fails authentication too: the file
+  is delivered as one, so it is loaded as one.
+- The consumer unpacks `secrets.tar` with the system tar, from its standard input and with
+  `--no-same-owner`, into a fresh folder. That folder must hold exactly the secrets' files, each the
+  file `WriteProtectedSecretFiles` wrote byte for byte, and each reads as its value through a
+  `FilePerSecretCache`.
+
+The producer checks the writer itself before writing anything. Each file name is the one the
+fixtures give. The constructor refuses each `refused` list: no names; two names whose file names
+differ only in ASCII case, which a case-insensitive file system would write as one file; a store
+name the store can't hold; an empty key; and a file name that `FilePerSecretCache` couldn't read.
+The pull keeps exactly the secrets named, and the pull of the `missing` names fails as missing and
+keeps nothing. Those names include values the writer must leave out: an empty string, `null`, an
+object, an array, a key of a value that isn't JSON, and an empty secret. The archive, piped into a
+`tar -x` process the producer runs, unpacks to exactly the files `WriteProtectedSecretFiles` wrote.
+
+The matrix compares every producer's pipeline JSON with the layout .NET's `Utf8JsonWriter` gives it,
+indented with relaxed escaping, with each `enc::v3::` value's base64 masked. A one-producer run is
+checked too. The layout has one member per line in ordinal file-name order (`Prod__Db` before
+`brace`). Each line is indented two spaces, with a space after each colon. Lines end as the platform
+ends them, CRLF on Windows and LF elsewhere. There is no byte order mark, no line ending after the
+closing brace, and `{}` when there are no secrets. A mismatch fails the run, and the report shows the
+first differing line, masked.
 
 ### Remote caches
 
@@ -222,11 +294,104 @@ cache --store C [--wrapper W] --service S --fixtures F --dir D
   `plaintextOf` names, followed by a newline when `trailingNewline` is set. If `empty` is set the file
   is empty, and if `copyOf` is set it is a byte-for-byte copy of that earlier file. On Windows,
   create the folder without an owner-only ACL, as the matrix does for `D`.
+- `pipeline/`, the secrets pipeline writer's output, as [The pipeline folder](#the-pipeline-folder)
+  below describes.
 
-For `native`, the producer creates the key file by piping the pipeline key's base64 to
-`hkdfguard wrap -kf D/dek.wrapped -sn S --dek-stdin`, never as an argument or environment variable.
-For every other wrapper, it decodes the pipeline key, wraps it with its own port of the wrapper,
-writes the wrapped bytes as the key file and zeroes its copy of the key.
+The producer gets the DEK only through its protector's write-DEK method (the table below), never by
+formatting the key itself. First it writes the DEK into a buffer in memory, preferably pinned. It
+checks the buffer holds exactly 44 bytes, the same as the protector's key-as-base64 accessor's
+characters (.NET `GetKeyAsBase64`, Go `KeyBase64`), with no line ending. It decodes
+them into the 32 bytes it hashes for `dekSha256`, then zeroes the buffer. For `native`, it then
+starts `hkdfguard wrap -kf D/dek.wrapped -sn S --dek-stdin` and has write-DEK write straight into
+that process's standard input, which it then closes. The DEK is never an argument or an environment
+variable. For every other wrapper, it wraps the decoded key with its own port of the wrapper, writes
+the wrapped bytes as the key file and zeroes its copy of the key.
+
+#### The pipeline folder
+
+The producer subclasses its port's `SecretPipelineWriter` base over an in-memory store (Go: gives
+`pipeline.New` a `SecretStore`). The store holds the fixtures' `pipeline.store`. A store name is valid
+if it matches `^[A-Za-z0-9/_.-]+$`, and there is no default key. To read a secret, the store looks
+up its name exactly, matching case. If the name is there, the store hands the UTF-8 bytes of its text
+to the base's protect-secret helper, which protects the whole value and, for a JSON object, each key
+requested. It zeroes those bytes afterwards. If the name isn't there, it returns without a value.
+Every writer uses the release's pipeline protector and never disposes it. In order:
+
+1. For each `pipeline.secrets` entry, the base's file-name function of `name` is `fileName`.
+2. The writer constructor refuses each list in `pipeline.refused` with the port's invalid-argument
+   error.
+3. A writer over the `name`s of `pipeline.secrets`, in fixture order, pulls without error. Its
+   protected secrets are exactly the `fileName`s. It then writes, creating `D/pipeline` first:
+   - `secrets.json`: write-JSON-secrets to that path.
+   - `secrets.stream.json`: write-JSON-secrets-to-a-stream into a file the producer opens, then
+     closes.
+   - `files/`: write-protected-secret-files to that folder.
+   - `secrets.tar`: write-protected-secret-files-to-a-stream into a file the producer opens, then
+     closes.
+   - `unpacked/`: the producer creates the folder and starts the system tar (below) with
+     `-x --no-same-owner -f - -C D/pipeline/unpacked`. It has write-protected-secret-files-to-a-stream
+     write into tar's standard input, closes that input, and requires exit code 0. Each file in
+     `files/` must then be in `unpacked/`, byte for byte.
+4. A writer over `pipeline.missing` fails its pull with the port's missing-secret error. Its protected
+   secrets are then empty. It writes `secrets.empty.json` with write-JSON-secrets to that path.
+
+The system tar is `%SystemRoot%\System32\tar.exe` on Windows and `tar` on `PATH` elsewhere. It
+always runs as a child process with its arguments in a list, never through a shell. If any step
+fails, `produce` prints `FAIL …` and exits 1. It never prints a value or a protected secret.
+
+`consume`, after the `secrets/` checks, reads `D/pipeline` and makes these 39 checks, in this order,
+whatever happened to the ones before. Each cache is built with `KeyFileTrust` naming the driver's
+own account, the release's key ring and the default format provider. "Missing" means 0 bytes and no
+error. "Fails authentication" means the same error the `refused` file check expects (.NET:
+`AuthenticationTagMismatchException`).
+
+1. A `JsonSecretsFileReadOnlyCache` over `secrets.json` reads, for each `pipeline.secrets` entry,
+   its `fileName` and then each `alsoReadAs` name as its `plaintext`. That makes 14 checks.
+2. The same cache has each name in `missingLookups`, then each in `invalidLookups`, as missing.
+   That makes 8 checks.
+3. `secrets.stream.json` is `secrets.json`, byte for byte.
+4. `secrets.empty.json` is exactly the 2 bytes `{}`.
+5. A new cache over `secrets.empty.json` has the first `pipeline.secrets` entry's `fileName` as
+   missing.
+6. The work folder is `D/pipeline/consumed-by-<driver>` (`consumed-by-go`, and so on). The consumer
+   deletes it if it is there, then makes it, on Windows without an owner-only ACL. It parses
+   `secrets.json`'s members in file order; fewer than 3 fails here. Then come 2 checks, each through
+   a new cache over a file the consumer writes in any valid JSON layout. Each must fail
+   authentication when it looks up the last member, which neither change touches:
+   - `swapped.json`, with the values of the first two members exchanged.
+   - `flipped.json`, with the first member's value tampered as the release's tag check does: the low
+     bit of the last byte of its decoded base64 body flipped.
+7. The consumer makes `unpacked/` in the work folder. It streams `secrets.tar` into the standard input
+   of the system tar, run with `-x --no-same-owner -f - -C <work>/unpacked`, closes that input, and
+   requires exit code 0. A failure here fails here and skips the rest. Then come 12 checks:
+   - the folder's entries are exactly the `fileName`s, compared as ordinal sets (1 check);
+   - through a `FilePerSecretCache` over it, each `pipeline.secrets` entry's file is `files/`'s
+     byte for byte, and reads under its exact `fileName` as its `plaintext` (11 checks).
+
+A file that is missing makes its checks fail, not the driver crash. Its checks print `FAIL` lines
+and leave the others to run.
+
+The ports name these methods differently:
+
+| | .NET | Go | Java | Node | Python |
+| --- | --- | --- | --- | --- | --- |
+| write-DEK | `WriteDekAsync(stream)` | `WriteDEK(ctx, w)` | `writeDekAsync(out)` | `writeDek(writable)` | `write_dek(stream)` |
+| Writer base | `SecretPipelineWriter` | `pipeline.New` + `SecretStore` | `SecretPipelineWriterBase` | `SecretPipelineWriter` | `SecretPipelineWriter` |
+| read one secret | `ReadSecretAsync` | `SecretStore.ReadSecret` | `readSecret` | `readSecret` | `_read_secret` |
+| protect-secret | `ProtectSecret` | `Secret.ProtectSecret` | `protectSecret` | `protectSecret` | `_protect_secret` |
+| file name | `GetFileName` | `pipeline.FileName` | `getFileName` | `getFileName` | `get_file_name` |
+| pull | `PullSecretsAsync` | `PullSecrets` | `pullSecretsAsync` | `pullSecrets` | `pull_secrets` |
+| write-JSON-secrets | `WriteJsonSecrets(path)` | `WriteJSONSecrets` | `writeJsonSecrets(Path)` | `writeJsonSecrets` | `write_json_secrets` |
+| …to a stream | `WriteJsonSecretsAsync` | `WriteJSONSecretsTo` | `writeJsonSecretsAsync` | `writeJsonSecretsTo` | `write_json_secrets_to_stream` |
+| write-protected-secret-files | `WriteProtectedSecretFiles` | `WriteProtectedSecretFiles` | `writeProtectedSecretFiles` | `writeProtectedSecretFiles` | `write_protected_secret_files` |
+| …to a stream (tar) | `WriteProtectedSecretFilesAsync` | `WriteProtectedSecretFilesTo` | `writeProtectedSecretFilesAsync` | `writeProtectedSecretFilesTo` | `write_protected_secret_files_to_stream` |
+| invalid-argument error | `ArgumentException` | `ErrInvalidArgument` | `IllegalArgumentException` | `InvalidArgumentError` | `ValueError` |
+| missing-secret error | `KeyNotFoundException` | `ErrSecretNotFound` | `NoSuchElementException` | `SecretsNotFoundError` | `KeyNotFoundError` |
+| JSON secrets cache | `JsonSecretsFileReadOnlyCache` | `jsonsecretsfile.New` | `JsonSecretsFileReadOnlyCacheImpl` | `JsonSecretsFileReadOnlyCache` | `JsonSecretsFileReadOnlyCache` |
+
+Python's `_async` variants, `write_dek_async`, `write_json_secrets_async` and
+`write_protected_secret_files_async`, may be used in place of the stream methods. Every write-to-a-
+stream method flushes its destination and leaves it open, so the driver closes it.
 
 `consume` refuses a release whose `wrapper` isn't its `--wrapper`. `cache` builds its key ring over
 `D`'s release exactly as `consume` does. Each wrapper and cache is built from the settings above,
@@ -257,7 +422,10 @@ The matrix installs with `npm ci`, `uv sync --locked` and `dotnet restore --lock
 rather than re-resolve when a lockfile no longer matches its manifest. When a port adds or changes a
 dependency, refresh the lockfile on purpose and review the diff: `npm install` in `drivers/node`,
 `uv lock --project drivers/python`, `go mod tidy` in `drivers/go`, or
-`dotnet restore drivers/dotnet/HkdfGuard.Interop.csproj --force-evaluate`.
+`dotnet restore drivers/dotnet/HkdfGuard.Interop.csproj --force-evaluate`. That last one also
+re-evaluates every hkdfguard-dotnet project the driver references, and rewrites their own
+`packages.lock.json` files in that checkout, so run `git checkout -- '*packages.lock.json'` in
+hkdfguard-dotnet afterwards. The driver's lockfile is the only one to keep.
 
 ## CI
 

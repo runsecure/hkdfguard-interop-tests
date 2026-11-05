@@ -16,13 +16,16 @@ require (
 	github.com/runsecure/hkdfguard-go/cache/filepersecret v0.9.1
 	github.com/runsecure/hkdfguard-go/cache/googlesecretmanager v0.9.1
 	github.com/runsecure/hkdfguard-go/cache/hashicorpvault v0.9.1
+	github.com/runsecure/hkdfguard-go/cache/jsonsecretsfile v0.9.1
 	github.com/runsecure/hkdfguard-go/cryptoprovider/aesgcm256 v0.9.1
 	github.com/runsecure/hkdfguard-go/keywrapping/awskms v0.9.1
 	github.com/runsecure/hkdfguard-go/keywrapping/azurekeyvault v0.9.1
 	github.com/runsecure/hkdfguard-go/keywrapping/googlekms v0.9.1
 	github.com/runsecure/hkdfguard-go/keywrapping/hashicorpvault v0.9.1
 	github.com/runsecure/hkdfguard-go/keywrapping/nativev1 v0.9.1
+	github.com/runsecure/hkdfguard-go/pipeline v0.9.1
 	github.com/runsecure/hkdfguard-go/securefile v0.9.1
+	golang.org/x/sys v0.49.0
 )
 
 require (
@@ -87,7 +90,6 @@ require (
 	golang.org/x/net v0.62.0 // indirect
 	golang.org/x/oauth2 v0.37.0 // indirect
 	golang.org/x/sync v0.24.0 // indirect
-	golang.org/x/sys v0.49.0 // indirect
 	golang.org/x/text v0.43.0 // indirect
 	golang.org/x/time v0.16.0 // indirect
 	google.golang.org/api v0.304.0 // indirect
@@ -106,11 +108,13 @@ replace (
 	github.com/runsecure/hkdfguard-go/cache/filepersecret => ../../../hkdfguard-go/cache/filepersecret
 	github.com/runsecure/hkdfguard-go/cache/googlesecretmanager => ../../../hkdfguard-go/cache/googlesecretmanager
 	github.com/runsecure/hkdfguard-go/cache/hashicorpvault => ../../../hkdfguard-go/cache/hashicorpvault
+	github.com/runsecure/hkdfguard-go/cache/jsonsecretsfile => ../../../hkdfguard-go/cache/jsonsecretsfile
 	github.com/runsecure/hkdfguard-go/cryptoprovider/aesgcm256 => ../../../hkdfguard-go/cryptoprovider/aesgcm256
 	github.com/runsecure/hkdfguard-go/keywrapping/awskms => ../../../hkdfguard-go/keywrapping/awskms
 	github.com/runsecure/hkdfguard-go/keywrapping/azurekeyvault => ../../../hkdfguard-go/keywrapping/azurekeyvault
 	github.com/runsecure/hkdfguard-go/keywrapping/googlekms => ../../../hkdfguard-go/keywrapping/googlekms
 	github.com/runsecure/hkdfguard-go/keywrapping/hashicorpvault => ../../../hkdfguard-go/keywrapping/hashicorpvault
 	github.com/runsecure/hkdfguard-go/keywrapping/nativev1 => ../../../hkdfguard-go/keywrapping/nativev1
+	github.com/runsecure/hkdfguard-go/pipeline => ../../../hkdfguard-go/pipeline
 	github.com/runsecure/hkdfguard-go/securefile => ../../../hkdfguard-go/securefile
 )

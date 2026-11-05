@@ -6,6 +6,7 @@ import com.fasterxml.jackson.databind.SerializationFeature;
 import io.github.runsecure.hkdfguard.abstractions.ArrayUtility;
 import io.github.runsecure.hkdfguard.abstractions.CryptographicException;
 import io.github.runsecure.hkdfguard.abstractions.KeyWrapper;
+import io.github.runsecure.hkdfguard.abstractions.PipelineDataProtector;
 import io.github.runsecure.hkdfguard.abstractions.ProtectedCache;
 import io.github.runsecure.hkdfguard.abstractions.ProtectedConfigurationPurpose;
 import io.github.runsecure.hkdfguard.abstractions.ProtectedReadOnlyCache;
@@ -17,6 +18,7 @@ import io.github.runsecure.hkdfguard.cryptoprovider.aesgcm256.AesGcmPipelineData
 import io.github.runsecure.hkdfguard.dataencryptionkey.KeyRingBuilder;
 import io.github.runsecure.hkdfguard.dataencryptionkey.KeyRingImpl;
 import io.github.runsecure.hkdfguard.dataencryptionkey.formatprovider.DefaultFormatProviderImpl;
+import io.github.runsecure.hkdfguard.interop.Pipeline.PipelineFixtures;
 import io.github.runsecure.hkdfguard.interop.Wrappers.OpenWrapper;
 import io.github.runsecure.hkdfguard.securefile.KeyFileTrust;
 import java.nio.charset.StandardCharsets;
@@ -41,9 +43,10 @@ import java.util.regex.Pattern;
 
 /**
  * The Java driver for the HkdfGuard interop matrix: it produces a release (pipeline encryption plus a
- * key file wrapped by one key wrapper), consumes any driver's release with its own port of the same
- * wrapper, and reads a remote secret store through its cache over that release's key ring. See the
- * repository README for the contract every driver follows.
+ * key file wrapped by one key wrapper, and the secrets pipeline writer's files, JSON and tar archive),
+ * consumes any driver's release with its own port of the same wrapper and caches, and reads a remote
+ * secret store through its cache over that release's key ring. See the repository README for the
+ * contract every driver follows.
  */
 public final class Main {
     static final String RELEASE_FILE = "release.json";
@@ -77,7 +80,7 @@ public final class Main {
      */
     record SecretFile(String name, String plaintext, String plaintextOf, boolean trailingNewline, boolean empty, String copyOf, String expect) {}
 
-    record Fixtures(int keyVersion, List<Secret> secrets, List<SecretFile> files, List<String> missingFiles) {
+    record Fixtures(int keyVersion, List<Secret> secrets, List<SecretFile> files, List<String> missingFiles, PipelineFixtures pipeline) {
         Fixtures {
             files = files != null ? files : List.of();
             missingFiles = missingFiles != null ? missingFiles : List.of();
@@ -161,27 +164,20 @@ public final class Main {
                 values.put(s.identifier(), pipeline.encrypt(s.plaintext(), s.identifier()));
             }
 
-            // The pipeline key's base64 as ASCII bytes, never as a String.
-            var base64 = pipeline.getKeyAsBase64();
-            var keyText = new byte[base64.remaining()];
-            for (int i = 0; i < keyText.length; i++) {
-                keyText[i] = (byte) base64.get(base64.position() + i);
-            }
-            byte[] raw = null;
+            // The DEK only ever through writeDekAsync, never formatted here.
+            var raw = new byte[KEY_SIZE];
             try {
-                raw = Base64.getDecoder().decode(keyText);
-                if (raw.length != KEY_SIZE) {
-                    throw new IllegalStateException("the pipeline key is " + raw.length + " bytes, not " + KEY_SIZE);
-                }
+                Pipeline.readDekThroughWriteDek(pipeline, raw);
                 // Test only: a hash of the DEK, so every consumer can prove it unwrapped this same key.
                 // Never record anything derived from a DEK beside its key file in a real pipeline.
                 var digest = HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(raw));
 
                 Files.createDirectories(dir);
                 writeSecretFiles(pipeline, fixtures, dir.resolve(SECRETS_DIR));
+                Pipeline.writePipeline(pipeline, fixtures.pipeline(), dir);
                 var path = dir.resolve(KEY_FILE);
                 if (wrapperName.equals(Wrappers.NATIVE)) {
-                    wrapNatively(cli, path, service, keyText);
+                    wrapNatively(cli, path, service, pipeline);
                 } else {
                     try (var open = Wrappers.open(wrapperName, service, Wrappers.WRAP_CONTEXT)) {
                         var wrapped = new byte[WrappedKeyLimits.MAX_BYTES];
@@ -198,25 +194,36 @@ public final class Main {
                 var release = new Release("java", wrapperName, service, fixtures.keyVersion(), digest, values);
                 writePrivate(dir.resolve(RELEASE_FILE), JSON.writeValueAsBytes(release));
             } finally {
-                ArrayUtility.zeroMemory(keyText);
-                if (raw != null) {
-                    ArrayUtility.zeroMemory(raw);
-                }
+                ArrayUtility.zeroMemory(raw);
             }
-            System.out.printf("OK produced %d secrets in %s%n", values.size(), dir);
+            System.out.printf("OK produced %d secrets and %d pipeline secrets in %s%n", values.size(), fixtures.pipeline().secrets().size(), dir);
             return true;
         }
     }
 
-    /** Pipes the key's base64 to hkdfguard wrap --dek-stdin: never an argument or environment variable. */
-    private static void wrapNatively(String cli, Path path, String service, byte[] keyText) throws Exception {
+    /**
+     * Writes the pipeline key with writeDekAsync straight into the standard input of
+     * hkdfguard wrap --dek-stdin: never an argument or an environment variable, and never a copy here.
+     * Closing its input is what tells the tool the key is complete.
+     */
+    private static void wrapNatively(String cli, Path path, String service, PipelineDataProtector pipeline) throws Exception {
         var process = new ProcessBuilder(cli, "wrap", "-kf", path.toString(), "-sn", service, "--dek-stdin")
                 .redirectErrorStream(true)
                 .start();
+        var drained = CompletableFuture.supplyAsync(() -> {
+            try {
+                return new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8).strip();
+            } catch (java.io.IOException e) {
+                return describe(e);
+            }
+        });
         try (var stdin = process.getOutputStream()) {
-            stdin.write(keyText);
+            await(pipeline.writeDekAsync(stdin));
+        } catch (Exception e) {
+            process.destroy();
+            throw e;
         }
-        var output = new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8).strip();
+        var output = drained.join();
         int exit = process.waitFor();
         if (exit != 0) {
             throw new IllegalStateException("hkdfguard wrap: exit status " + exit + ": " + output);
@@ -325,6 +332,7 @@ public final class Main {
 
             checkCache(checks, new ProtectedCacheImpl(ring), fixtures);
             checkSecretFiles(checks, ring, fixtures, dir.resolve(SECRETS_DIR));
+            Pipeline.checkPipeline(checks, ring, fixtures.pipeline(), dir);
             return checks.finish("the " + release.producer() + " " + release.wrapper() + " release");
         }
     }
@@ -462,7 +470,7 @@ public final class Main {
     }
 
     /** Flips one bit in the last byte (the GCM tag) of a formatted value. */
-    private static String tamper(String value) {
+    static String tamper(String value) {
         var match = FORMAT.matcher(value);
         if (!match.matches()) {
             throw new IllegalArgumentException("not an enc::v<version>::<base64> value");
@@ -511,9 +519,14 @@ public final class Main {
             return type.isInstance(failure);
         }
 
+        /** "got N bytes": the length of what was read, never the value. */
+        String bytes() {
+            return "got " + (got == null ? 0 : got.getBytes(StandardCharsets.UTF_8).length) + " bytes";
+        }
+
         @Override
         public String toString() {
-            return "got " + (got == null ? 0 : got.getBytes(StandardCharsets.UTF_8).length) + " bytes, " + (failure == null ? "no error" : error());
+            return bytes() + ", " + (failure == null ? "no error" : error());
         }
     }
 

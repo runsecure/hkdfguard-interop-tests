@@ -1,24 +1,30 @@
 'use strict';
 // The Node.js driver for the HkdfGuard interop matrix: it produces a release (pipeline encryption plus
-// a key file wrapped by one key wrapper), consumes any driver's release with its own port of the same
-// wrapper, and reads a remote secret store through its cache over that release's key ring. See the
-// repository README for the contract every driver follows.
+// a key file wrapped by one key wrapper, and the secrets pipeline writer's files, JSON and tar
+// archive), consumes any driver's release with its own port of the same wrapper and caches, and reads
+// a remote secret store through its cache over that release's key ring. See the repository README for
+// the contract every driver follows; the .NET driver is the reference this one is ported from.
 
-const { execFileSync, spawnSync } = require('node:child_process');
+const { execFileSync, spawn } = require('node:child_process');
 const { createHash } = require('node:crypto');
-const { mkdirSync, readFileSync, writeFileSync } = require('node:fs');
+const { createReadStream, createWriteStream, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } = require('node:fs');
 const { join } = require('node:path');
+const { Writable } = require('node:stream');
+const { pipeline: pipeStreams } = require('node:stream/promises');
 const { parseArgs } = require('node:util');
 const { KMSClient } = require('@aws-sdk/client-kms');
 const { SecretsManagerClient } = require('@aws-sdk/client-secrets-manager');
 const { DefaultAzureCredential } = require('@azure/identity');
 const { KeyManagementServiceClient } = require('@google-cloud/kms');
-const { AlreadyExistsError, AuthenticationFailedError, configurationPurpose, MAX_WRAPPED_KEY_BYTES, wipe } = require('@runsecure/hkdfguard-abstractions');
+const {
+  AlreadyExistsError, AuthenticationFailedError, configurationPurpose, InvalidArgumentError, MAX_WRAPPED_KEY_BYTES, wipe,
+} = require('@runsecure/hkdfguard-abstractions');
 const { EmptyValueError, FilePerSecretCache, ProtectedCache } = require('@runsecure/hkdfguard-cache');
 const { AwsSecretsManagerSecretCache } = require('@runsecure/hkdfguard-cache-awssecretsmanager');
 const { AzureKeyVaultSecretCache } = require('@runsecure/hkdfguard-cache-azurekeyvault');
 const { GoogleSecretManagerSecretCache } = require('@runsecure/hkdfguard-cache-googlesecretmanager');
 const { HashiCorpVaultSecretCache, StaticVaultToken } = require('@runsecure/hkdfguard-cache-hashicorpvault');
+const { JsonSecretsFileReadOnlyCache } = require('@runsecure/hkdfguard-cache-jsonsecretsfile');
 const { AesGcmCryptoProviderFactory, AesGcmPipelineDataProtector, KEY_SIZE } = require('@runsecure/hkdfguard-cryptoprovider-aesgcm256');
 const { buildKeyRing, DefaultFormatProvider } = require('@runsecure/hkdfguard-dek');
 const { AwsKmsKeyWrapper } = require('@runsecure/hkdfguard-keywrapping-awskms');
@@ -26,6 +32,7 @@ const { AzureKeyVaultKeyWrapper } = require('@runsecure/hkdfguard-keywrapping-az
 const { GoogleKmsKeyWrapper } = require('@runsecure/hkdfguard-keywrapping-googlekms');
 const { HashiCorpVaultTransitKeyWrapper, StaticVaultTokenSource } = require('@runsecure/hkdfguard-keywrapping-hashicorpvault');
 const { NativeKeyWrapperV1 } = require('@runsecure/hkdfguard-keywrapping-native-v1');
+const { SecretPipelineWriter, SecretsNotFoundError } = require('@runsecure/hkdfguard-pipeline');
 const { KeyFileTrust } = require('@runsecure/hkdfguard-securefile');
 
 const RELEASE_FILE = 'release.json';
@@ -33,6 +40,18 @@ const KEY_FILE = 'dek.wrapped';
 const SECRETS_DIR = 'secrets';
 const FORMAT = /^(enc::v\d+::)(.+)$/s;
 const NATIVE = 'native';
+
+const PIPELINE_DIR = 'pipeline';
+const JSON_SECRETS_FILE = 'secrets.json';
+const STREAM_JSON_SECRETS_FILE = 'secrets.stream.json';
+const EMPTY_JSON_SECRETS_FILE = 'secrets.empty.json';
+const SECRETS_TAR = 'secrets.tar';
+const PIPELINE_FILES_DIR = 'files';
+const PIPELINE_UNPACKED_DIR = 'unpacked';
+const CONSUMER_DIR = 'consumed-by-node';
+
+// The base64 of a 32-byte key: 44 ASCII characters, no line ending.
+const KEY_BASE64_LENGTH = 44;
 
 // The context every port's integration tests bind their key files to, so the matrix runs under the
 // IAM, key and token policies already written for those tests.
@@ -56,8 +75,9 @@ function usage() {
 
 /**
  * Does what a release pipeline does: encrypts every fixture under a fresh pipeline key, writes the
- * values, and wraps the key into the key file - by handing it to the native tool on standard input,
- * or through a network key wrapper in this process.
+ * values and the secrets pipeline writer's output, and wraps the key into the key file - by having
+ * writeDek write it into the native tool's standard input, or through a network key wrapper in this
+ * process.
  */
 async function produce(wrapperName, service, fixtures, dir, cli) {
   const pipeline = new AesGcmPipelineDataProtector(new DefaultFormatProvider(), fixtures.keyVersion);
@@ -66,22 +86,17 @@ async function produce(wrapperName, service, fixtures, dir, cli) {
     const encoder = new TextEncoder();
     const values = Object.fromEntries(fixtures.secrets.map((s) => [s.identifier, pipeline.encrypt(encoder.encode(s.plaintext), s.identifier)]));
 
+    await readDekThroughWriteDek(pipeline, raw);
     // Test only: a hash of the DEK, so every consumer can prove it unwrapped this same key. Never
-    // record anything derived from a DEK beside its key file in a real pipeline. Node has no
-    // buffer-to-buffer base64 decode, so the key also passes through an immutable string that can't
-    // be zeroed; acceptable for a throwaway test key only. The tool itself gets the base64 buffer.
-    const base64 = pipeline.keyBase64();
-    const n = Buffer.from(Buffer.from(base64.buffer, base64.byteOffset, base64.byteLength).toString('latin1'), 'base64').copy(raw);
-    if (n !== KEY_SIZE) throw new Error(`decoding the pipeline key: ${n} bytes`);
+    // record anything derived from a DEK beside its key file in a real pipeline.
     const dekSha256 = createHash('sha256').update(raw).digest('hex');
 
     mkdirSync(dir, { recursive: true, mode: 0o700 });
     writeSecretFiles(pipeline, fixtures, join(dir, SECRETS_DIR));
+    await writePipeline(pipeline, fixtures.pipeline, dir);
     const path = join(dir, KEY_FILE);
     if (wrapperName === NATIVE) {
-      const wrap = spawnSync(cli, ['wrap', '-kf', path, '-sn', service, '--dek-stdin'], { input: base64 });
-      if (wrap.error) throw wrap.error;
-      if (wrap.status !== 0) throw new Error(`hkdfguard wrap exited ${wrap.status}: ${`${wrap.stdout}${wrap.stderr}`.trim()}`);
+      await wrapNatively(cli, path, service, pipeline);
     } else {
       const w = newWrapper(wrapperName, service, WRAP_CONTEXT);
       try {
@@ -100,11 +115,227 @@ async function produce(wrapperName, service, fixtures, dir, cli) {
 
     const release = { producer: 'node', wrapper: wrapperName, service, keyVersion: fixtures.keyVersion, dekSha256, values };
     writeFileSync(join(dir, RELEASE_FILE), JSON.stringify(release, null, 2), { mode: 0o600 });
-    console.log(`OK produced ${Object.keys(values).length} secrets in ${dir}`);
+    console.log(`OK produced ${Object.keys(values).length} secrets and ${fixtures.pipeline.secrets.length} pipeline secrets in ${dir}`);
   } finally {
     wipe(raw);
     pipeline.close();
   }
+}
+
+/**
+ * Writes the pipeline key with writeDek straight into the standard input of
+ * `hkdfguard wrap --dek-stdin`: never an argument or an environment variable, and never a copy here.
+ * Ending its input is what tells the tool the key is complete.
+ */
+async function wrapNatively(cli, path, service, pipeline) {
+  const wrap = spawn(cli, ['wrap', '-kf', path, '-sn', service, '--dek-stdin'], { stdio: ['pipe', 'pipe', 'pipe'] });
+  const exited = exitOf(wrap);
+  try {
+    await pipeline.writeDek(wrap.stdin);
+  } finally {
+    wrap.stdin.end();
+  }
+  const { code, output } = await exited;
+  if (code !== 0) throw new Error(`hkdfguard wrap exited ${code}: ${output}`);
+}
+
+/**
+ * Writes the pipeline key through writeDek, as the wrap tool's --dek-stdin reads it, into a buffer
+ * of this driver's own, and decodes it into dek: so every wrapper's key file comes from those bytes,
+ * and every consumer's DEK check proves them. Checks they are exactly the key's 44 base64 characters
+ * as ASCII, the same as keyBase64's, without a line ending. writeDek zeroes its buffer once the write
+ * calls back, so this stream copies each chunk before calling back, as a file or a pipe would.
+ */
+async function readDekThroughWriteDek(pipeline, dek) {
+  const ascii = new Uint8Array(KEY_BASE64_LENGTH + 2);
+  let written = 0;
+  let overflow = false;
+  const destination = new Writable({
+    write(chunk, _encoding, callback) {
+      if (written + chunk.length > ascii.length) overflow = true;
+      else ascii.set(chunk, written);
+      written += chunk.length;
+      callback();
+    },
+  });
+  const key = pipeline.keyBase64();
+  try {
+    await pipeline.writeDek(destination);
+    destination.end();
+    let same = !overflow && written === key.length;
+    for (let i = 0; same && i < written; i++) same = ascii[i] === key[i];
+    if (written !== KEY_BASE64_LENGTH || !same) {
+      throw new Error(`writeDek wrote ${written} bytes, not the key's ${KEY_BASE64_LENGTH} base64 characters`);
+    }
+    // Node has no buffer-to-buffer base64 decode, so the key also passes through an immutable string
+    // that can't be zeroed; acceptable for a throwaway test key only.
+    const n = Buffer.from(Buffer.from(ascii.buffer, 0, written).toString('latin1'), 'base64').copy(dek);
+    if (n !== KEY_SIZE) throw new Error("The pipeline key isn't 32 bytes.");
+  } finally {
+    wipe(ascii);
+    wipe(key);
+  }
+}
+
+/**
+ * A SecretPipelineWriter over an in-memory store: each store name maps to its value's exact text,
+ * handed to the base's protectSecret as UTF-8 and zeroed after. Names match exactly, and a store name
+ * is 1 or more ASCII letters, digits, '/', '_', '.' and '-'.
+ */
+class InMemorySecretPipelineWriter extends SecretPipelineWriter {
+  #store;
+
+  constructor(protector, secretNames, store) {
+    super(protector, secretNames, (name) => /^[A-Za-z0-9/_.-]+$/.test(name));
+    this.#store = new Map(Object.entries(store));
+  }
+
+  async readSecret(name, requests, values) {
+    const text = this.#store.get(name);
+    if (text === undefined) return;
+    const secret = new TextEncoder().encode(text);
+    try {
+      this.protectSecret(secret, requests, values);
+    } finally {
+      wipe(secret);
+    }
+  }
+}
+
+/**
+ * Writes the release's pipeline folder: every fixture in the fixtures' pipeline section pulled
+ * through this port's real SecretPipelineWriter base, over an in-memory store, and written in each of
+ * the writer's layouts. The writers use the release's own pipeline protector, so every value decrypts
+ * under the release's key ring, and they never close it.
+ */
+async function writePipeline(pipeline, fixtures, dir) {
+  for (const s of fixtures.secrets) {
+    if (SecretPipelineWriter.getFileName(s.name) !== s.fileName) throw new Error(`pipeline: ${s.name}'s file name isn't ${s.fileName}`);
+  }
+  for (const names of fixtures.refused) {
+    let refused;
+    try {
+      refused = new InMemorySecretPipelineWriter(pipeline, names, fixtures.store);
+    } catch (error) {
+      if (error instanceof InvalidArgumentError) continue;
+      throw error;
+    }
+    await refused.close();
+    throw new Error(`pipeline: the writer accepted [${names.join(', ')}]`);
+  }
+
+  const folder = join(dir, PIPELINE_DIR);
+  mkdirSync(folder, { recursive: true });
+  const writer = new InMemorySecretPipelineWriter(pipeline, fixtures.secrets.map((s) => s.name), fixtures.store);
+  try {
+    await writer.pullSecrets();
+    const kept = [...writer.protectedSecrets.keys()].sort();
+    const expected = fixtures.secrets.map((s) => s.fileName).sort();
+    if (kept.length !== expected.length || kept.some((name, i) => name !== expected[i])) {
+      throw new Error("pipeline: the writer's protected secrets aren't the fixtures' file names");
+    }
+
+    await writer.writeJsonSecrets(join(folder, JSON_SECRETS_FILE));
+    await writeToFile(join(folder, STREAM_JSON_SECRETS_FILE), (stream) => writer.writeJsonSecretsTo(stream));
+    await writer.writeProtectedSecretFiles(join(folder, PIPELINE_FILES_DIR));
+    await writeToFile(join(folder, SECRETS_TAR), (stream) => writer.writeProtectedSecretFilesTo(stream));
+
+    // As a deployment would: the archive straight into a tar process's standard input.
+    const unpacked = join(folder, PIPELINE_UNPACKED_DIR);
+    mkdirSync(unpacked, { recursive: true });
+    await untar(unpacked, (stdin) => writer.writeProtectedSecretFilesTo(stdin));
+    const difference = compareFolders(join(folder, PIPELINE_FILES_DIR), unpacked, fixtures.secrets.map((s) => s.fileName));
+    if (difference !== undefined) throw new Error(`pipeline: the archive piped to tar unpacked differently: ${difference}`);
+  } finally {
+    await writer.close();
+  }
+
+  const missing = new InMemorySecretPipelineWriter(pipeline, fixtures.missing, fixtures.store);
+  try {
+    let pulled = false;
+    try {
+      await missing.pullSecrets();
+      pulled = true;
+    } catch (error) {
+      if (!(error instanceof SecretsNotFoundError)) throw error;
+    }
+    if (pulled) throw new Error('pipeline: pulling secrets the store holds no value for succeeded');
+    if (missing.protectedSecrets.size !== 0) throw new Error(`pipeline: pulling only missing secrets kept ${missing.protectedSecrets.size}`);
+    await missing.writeJsonSecrets(join(folder, EMPTY_JSON_SECRETS_FILE));
+  } finally {
+    await missing.close();
+  }
+}
+
+/** Opens a file to write, has write write into it, then ends it and waits until it is written. */
+async function writeToFile(path, write) {
+  const stream = createWriteStream(path);
+  try {
+    await write(stream);
+  } catch (error) {
+    stream.destroy();
+    throw error;
+  }
+  await new Promise((resolve, reject) => {
+    stream.once('error', reject);
+    stream.end(resolve);
+  });
+}
+
+/**
+ * Runs the system tar - Windows' own bsdtar, else the tar on PATH - never through a shell, to unpack
+ * an archive from its standard input into folder: write writes the archive, and the input is ended
+ * afterwards. Requires exit code 0.
+ */
+async function untar(folder, write) {
+  const tar = spawn(tarPath(), ['-x', '--no-same-owner', '-f', '-', '-C', folder], { stdio: ['pipe', 'pipe', 'pipe'] });
+  const exited = exitOf(tar);
+  try {
+    await write(tar.stdin);
+  } finally {
+    tar.stdin.end();
+  }
+  const { code, output } = await exited;
+  if (code !== 0) throw new Error(`tar exited ${code}: ${output}`);
+}
+
+function tarPath() {
+  return process.platform === 'win32' ? join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'tar.exe') : 'tar';
+}
+
+/**
+ * The exit code of a child process and what it printed, once it has exited; rejects if it couldn't
+ * start. An error writing to its input, such as EPIPE once it has exited, is the writer's to report,
+ * and shows in the exit code.
+ */
+function exitOf(child) {
+  let output = '';
+  child.stdout.on('data', (chunk) => { output += chunk; });
+  child.stderr.on('data', (chunk) => { output += chunk; });
+  child.stdin.on('error', () => {});
+  const exited = new Promise((resolve, reject) => {
+    child.once('error', reject);
+    child.once('close', (code) => resolve({ code, output: output.trim() }));
+  });
+  // Awaited once the input is written: a failure to start mustn't be reported unhandled before then.
+  exited.catch(() => {});
+  return exited;
+}
+
+/** undefined if each named file in actual is the one in expected byte for byte, else what differs. */
+function compareFolders(expected, actual, names) {
+  for (const name of names) {
+    const path = join(actual, name);
+    if (statSync(path, { throwIfNoEntry: false })?.isFile() !== true) return `${name} is missing`;
+    let want;
+    try {
+      want = readFileSync(join(expected, name));
+    } catch (error) {
+      return `the written ${name} can't be read: ${describe(error)}`;
+    }
+    if (!readFileSync(path).equals(want)) return `${name} differs`;
+  }
+  return undefined;
 }
 
 /**
@@ -157,6 +388,7 @@ async function consume(wrapperName, service, fixtures, dir) {
 
     await checkCache(checks, new ProtectedCache(ring), fixtures);
     await checkSecretFiles(checks, ring, fixtures, join(dir, SECRETS_DIR));
+    await checkPipeline(checks, ring, fixtures.pipeline, dir);
   } finally {
     await ring.close();
     await wrapper.close();
@@ -233,6 +465,147 @@ async function checkSecretFiles(checks, ring, fixtures, folder) {
     const { got, error } = await attempt(() => readCache(files, name), true);
     checks.check(error === undefined && got === '', `files: ${name} is missing: got ${got?.length ?? 0} characters, ${message(error)}`);
   }
+}
+
+/**
+ * Reads the release's pipeline folder as a deployed application would: secrets.json through a
+ * JsonSecretsFileReadOnlyCache over the release's ring, tampered copies of it refused whole, and
+ * secrets.tar unpacked by the system tar and read through a FilePerSecretCache. 39 checks, in the
+ * README's order; a file that is missing fails its checks, never the driver.
+ */
+async function checkPipeline(checks, ring, fixtures, dir) {
+  const folder = join(dir, PIPELINE_DIR);
+  const trust = currentAccountTrust();
+  const format = new DefaultFormatProvider();
+  const jsonPath = join(folder, JSON_SECRETS_FILE);
+
+  let json;
+  try {
+    json = new JsonSecretsFileReadOnlyCache(jsonPath, trust, ring, format);
+  } catch (error) {
+    checks.fail(`pipeline: opening ${JSON_SECRETS_FILE}: ${describe(error)}`);
+  }
+  if (json !== undefined) {
+    for (const s of fixtures.secrets) {
+      for (const name of [s.fileName, ...(s.alsoReadAs ?? [])]) {
+        const { got, error } = await attempt(() => readCache(json, name), true);
+        checks.check(error === undefined && got === s.plaintext,
+          `pipeline: ${JSON_SECRETS_FILE} reads ${s.name} as ${name}: got ${bytes(got)} bytes, ${error === undefined ? 'wrong plaintext' : describe(error)}`);
+      }
+    }
+    for (const name of [...fixtures.missingLookups, ...fixtures.invalidLookups]) {
+      const { got, error } = await attempt(() => readCache(json, name), true);
+      checks.check(error === undefined && got === '', `pipeline: ${JSON_SECRETS_FILE} has no ${name}: got ${bytes(got)} bytes, ${describe(error)}`);
+    }
+  }
+
+  const { got: same, error: sameError } = await attempt(() => readFileSync(join(folder, STREAM_JSON_SECRETS_FILE)).equals(readFileSync(jsonPath)), true);
+  checks.check(same === true,
+    `pipeline: ${STREAM_JSON_SECRETS_FILE} is ${JSON_SECRETS_FILE} byte for byte: ${sameError === undefined ? 'it differs' : describe(sameError)}`);
+
+  const emptyPath = join(folder, EMPTY_JSON_SECRETS_FILE);
+  const { got: empty, error: emptyError } = await attempt(() => readFileSync(emptyPath).equals(Buffer.from('{}', 'ascii')), true);
+  checks.check(empty === true, `pipeline: ${EMPTY_JSON_SECRETS_FILE} is {}: ${emptyError === undefined ? "it isn't" : describe(emptyError)}`);
+  const first = fixtures.secrets[0].fileName;
+  const { got: nothing, error: nothingError } = await readFromNewCache(emptyPath, trust, ring, format, first);
+  checks.check(nothingError === undefined && nothing === '',
+    `pipeline: ${EMPTY_JSON_SECRETS_FILE} has no ${first}: got ${bytes(nothing)} bytes, ${describe(nothingError)}`);
+
+  // On Windows without an owner-only ACL, as the matrix makes D.
+  const work = join(folder, CONSUMER_DIR);
+  rmSync(work, { recursive: true, force: true });
+  mkdirSync(work, process.platform === 'win32' ? { recursive: true } : { recursive: true, mode: 0o700 });
+  await checkTampered(checks, ring, format, trust, jsonPath, work);
+  await checkArchive(checks, ring, fixtures, trust, folder, work);
+}
+
+/**
+ * Two copies of secrets.json, each changed one way, must each be refused whole: a lookup of a member
+ * the change didn't touch fails authentication too.
+ */
+async function checkTampered(checks, ring, format, trust, jsonPath, work) {
+  let members;
+  try {
+    // JSON.parse keeps members in file order unless a name is an array index ("0", "1", ...), which
+    // JavaScript objects list first; no fixture's file name is one.
+    const parsed = JSON.parse(readFileSync(jsonPath, 'utf8'));
+    if (!isObject(parsed)) throw new Error("it isn't a JSON object");
+    members = Object.entries(parsed);
+    if (members.some(([, value]) => typeof value !== 'string')) throw new Error("a member's value isn't a string");
+  } catch (error) {
+    checks.fail(`pipeline: parsing ${JSON_SECRETS_FILE} to tamper with it: ${describe(error)}`);
+    return;
+  }
+  if (members.length < 3) {
+    checks.fail(`pipeline: ${JSON_SECRETS_FILE} holds ${members.length} members, too few to tamper with`);
+    return;
+  }
+  const untouched = members[members.length - 1][0];
+
+  const swapped = members.map(([name, value]) => [name, value]);
+  swapped[0][1] = members[1][1];
+  swapped[1][1] = members[0][1];
+  let { got, error } = await readFromNewCache(writeMembers(join(work, 'swapped.json'), swapped), trust, ring, format, untouched);
+  checks.check(error instanceof AuthenticationFailedError,
+    `pipeline: ${JSON_SECRETS_FILE} with two values swapped is refused whole: got ${bytes(got)} bytes, ${describe(error)}`);
+
+  const flipped = members.map(([name, value]) => [name, value]);
+  try {
+    flipped[0][1] = tamper(members[0][1]);
+  } catch (tamperError) {
+    checks.fail(`pipeline: tampering ${members[0][0]}: ${describe(tamperError)}`);
+    return;
+  }
+  ({ got, error } = await readFromNewCache(writeMembers(join(work, 'flipped.json'), flipped), trust, ring, format, untouched));
+  checks.check(error instanceof AuthenticationFailedError,
+    `pipeline: ${JSON_SECRETS_FILE} with a flipped tag bit is refused whole: got ${bytes(got)} bytes, ${describe(error)}`);
+}
+
+/**
+ * Unpacks secrets.tar with the system tar, from its standard input, into a fresh folder: it must hold
+ * exactly the files writeProtectedSecretFiles wrote, byte for byte, each reading through a
+ * FilePerSecretCache as its value.
+ */
+async function checkArchive(checks, ring, fixtures, trust, folder, work) {
+  const unpacked = join(work, PIPELINE_UNPACKED_DIR);
+  mkdirSync(unpacked, { recursive: true });
+  try {
+    await untar(unpacked, (stdin) => pipeStreams(createReadStream(join(folder, SECRETS_TAR)), stdin, { end: false }));
+  } catch (error) {
+    checks.fail(`pipeline: unpacking ${SECRETS_TAR}: ${describe(error)}`);
+    return;
+  }
+
+  const names = fixtures.secrets.map((s) => s.fileName).sort();
+  const entries = readdirSync(unpacked).sort();
+  checks.check(entries.length === names.length && entries.every((name, i) => name === names[i]),
+    `pipeline: ${SECRETS_TAR} holds exactly the secrets' files: it holds ${entries.length}, not ${names.length}`);
+
+  let files;
+  try {
+    files = new FilePerSecretCache(unpacked, trust, ring, new DefaultFormatProvider());
+  } catch (error) {
+    checks.fail(`pipeline: opening the unpacked folder: ${describe(error)}`);
+    return;
+  }
+  for (const s of fixtures.secrets) {
+    const difference = compareFolders(join(folder, PIPELINE_FILES_DIR), unpacked, [s.fileName]);
+    const { got, error } = await attempt(() => readCache(files, s.fileName), true);
+    checks.check(difference === undefined && error === undefined && got === s.plaintext,
+      `pipeline: ${SECRETS_TAR}'s ${s.fileName} is the written file and reads as its value: `
+      + `${difference ?? `got ${bytes(got)} bytes, ${error === undefined ? 'wrong plaintext' : describe(error)}`}`);
+  }
+}
+
+/** A lookup through a new JsonSecretsFileReadOnlyCache over path, so nothing an earlier cache loaded is reused. */
+function readFromNewCache(path, trust, ring, format, name) {
+  return attempt(() => readCache(new JsonSecretsFileReadOnlyCache(path, trust, ring, format), name), true);
+}
+
+/** Writes members as a JSON object, in their order. The layout is this driver's own: the cache reads any valid JSON object. */
+function writeMembers(path, members) {
+  writeFileSync(path, JSON.stringify(Object.fromEntries(members), null, 2));
+  return path;
 }
 
 /**
@@ -614,6 +987,17 @@ async function attempt(body, keepError = false) {
   } catch (error) {
     return { error: keepError ? error : message(error) };
   }
+}
+
+/** An error's class and message, for a failed check; never a value. */
+function describe(error) {
+  if (error === undefined) return 'no error';
+  return error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+}
+
+/** A value's length in UTF-8 bytes: what a failure may say about a value it read, never more. */
+function bytes(value) {
+  return typeof value === 'string' ? Buffer.byteLength(value, 'utf8') : 0;
 }
 
 function message(error) {

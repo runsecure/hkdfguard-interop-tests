@@ -1,7 +1,8 @@
 // The .NET driver for the HkdfGuard interop matrix: it produces a release (pipeline encryption plus a
-// key file wrapped by one key wrapper), consumes any driver's release with its own port of the same
-// wrapper, and reads a remote secret store through its cache over that release's key ring. See the
-// repository README for the contract every driver follows.
+// key file wrapped by one key wrapper, and the secrets pipeline writer's files, JSON and tar archive),
+// consumes any driver's release with its own port of the same wrapper and caches, and reads a remote
+// secret store through its cache over that release's key ring. It is the reference the other drivers
+// are ported from. See the repository README for the contract every driver follows.
 
 using System.Diagnostics;
 using System.Security.Cryptography;
@@ -78,20 +79,18 @@ namespace HkdfGuard.Interop
             var dek = GC.AllocateArray<byte>(KeySize, pinned: true);
             try
             {
-                if (!Convert.TryFromBase64Chars(pipeline.GetKeyAsBase64(), dek, out var length) || length != KeySize)
-                {
-                    throw new InvalidOperationException("The pipeline key isn't 32 bytes.");
-                }
+                await ReadDekThroughWriteDek(pipeline, dek);
                 // Test only: a hash of the DEK, so every consumer can prove it unwrapped this same key.
                 // Never record anything derived from a DEK beside its key file in a real pipeline.
                 var digest = Convert.ToHexStringLower(SHA256.HashData(dek));
 
                 Directory.CreateDirectory(dir);
                 await WriteSecretFiles(pipeline, fixtures, Path.Combine(dir, SecretsDir));
+                await WritePipeline(pipeline, fixtures.Pipeline, dir);
                 var path = Path.Combine(dir, KeyFile);
                 if (wrapperName == Native)
                 {
-                    WrapNatively(cli, path, service, pipeline);
+                    await WrapNatively(cli, path, service, pipeline);
                 }
                 else
                 {
@@ -108,13 +107,14 @@ namespace HkdfGuard.Interop
             {
                 CryptographicOperations.ZeroMemory(dek);
             }
-            Console.WriteLine($"OK produced {values.Count} secrets in {dir}");
+            Console.WriteLine($"OK produced {values.Count} secrets and {fixtures.Pipeline.Secrets.Length} pipeline secrets in {dir}");
             return true;
         }
 
-        // Pipes the pipeline key's base64 to `hkdfguard wrap --dek-stdin`: never an argument or an
-        // environment variable. The only copy made here is pinned and zeroed once written.
-        private static void WrapNatively(string cli, string path, string service, AesGcmPipelineDataProtector pipeline)
+        // Writes the pipeline key with WriteDekAsync straight into the standard input of
+        // `hkdfguard wrap --dek-stdin`: never an argument or an environment variable, and never a
+        // copy here. Closing its input is what tells the tool the key is complete.
+        private static async Task WrapNatively(string cli, string path, string service, AesGcmPipelineDataProtector pipeline)
         {
             var start = new ProcessStartInfo(cli)
             {
@@ -131,23 +131,18 @@ namespace HkdfGuard.Interop
             var stdout = wrap.StandardOutput.ReadToEndAsync();
             var stderr = wrap.StandardError.ReadToEndAsync();
 
-            var key = pipeline.GetKeyAsBase64();
-            var ascii = GC.AllocateArray<byte>(key.Length, pinned: true);
             try
             {
-                Encoding.ASCII.GetBytes(key, ascii);
-                wrap.StandardInput.BaseStream.Write(ascii);
-                wrap.StandardInput.BaseStream.Flush();
+                await pipeline.WriteDekAsync(wrap.StandardInput.BaseStream);
             }
             finally
             {
-                CryptographicOperations.ZeroMemory(ascii);
+                wrap.StandardInput.Close();
             }
-            wrap.StandardInput.Close();
-            wrap.WaitForExit();
+            await wrap.WaitForExitAsync();
             if (wrap.ExitCode != 0)
             {
-                throw new InvalidOperationException($"hkdfguard wrap exited {wrap.ExitCode}: {(stdout.Result + stderr.Result).Trim()}");
+                throw new InvalidOperationException($"hkdfguard wrap exited {wrap.ExitCode}: {(await stdout + await stderr).Trim()}");
             }
         }
 
@@ -223,6 +218,7 @@ namespace HkdfGuard.Interop
 
             await CheckCache(checks, new ProtectedCache(ring), fixtures);
             await CheckSecretFiles(checks, ring, fixtures, Path.Combine(dir, SecretsDir));
+            await CheckPipeline(checks, ring, fixtures.Pipeline, dir);
             return checks.Finish($"the {release.Producer} {release.Wrapper} release");
         }
 
@@ -500,7 +496,7 @@ namespace HkdfGuard.Interop
         string? CopyOf,
         string Expect);
 
-    internal sealed record Fixtures(int KeyVersion, Secret[] Secrets, SecretFile[] Files, string[] MissingFiles)
+    internal sealed record Fixtures(int KeyVersion, Secret[] Secrets, SecretFile[] Files, string[] MissingFiles, PipelineFixtures Pipeline)
     {
         // The value file is written with: its own, or the named secret's.
         public string PlaintextOf(SecretFile file)

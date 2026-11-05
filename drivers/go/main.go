@@ -1,11 +1,11 @@
 // Command interop is the Go driver for the HkdfGuard interop matrix: it produces a release (pipeline
-// encryption plus a key file wrapped by one key wrapper), consumes any driver's release with its own
-// port of the same wrapper, and reads a remote secret store through its cache over that release's key
-// ring. See the repository README for the contract every driver follows.
+// encryption plus a key file wrapped by one key wrapper, and the secrets pipeline writer's files, JSON
+// and tar archive), consumes any driver's release with its own port of the same wrapper and caches,
+// and reads a remote secret store through its cache over that release's key ring. See the repository
+// README for the contract every driver follows.
 package main
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
@@ -15,7 +15,6 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -54,10 +53,11 @@ type secretFile struct {
 }
 
 type fixtures struct {
-	KeyVersion   int          `json:"keyVersion"`
-	Secrets      []secret     `json:"secrets"`
-	Files        []secretFile `json:"files"`
-	MissingFiles []string     `json:"missingFiles"`
+	KeyVersion   int              `json:"keyVersion"`
+	Secrets      []secret         `json:"secrets"`
+	Files        []secretFile     `json:"files"`
+	MissingFiles []string         `json:"missingFiles"`
+	Pipeline     pipelineFixtures `json:"pipeline"`
 }
 
 // plaintext is the value the file is written with: its own, or the named secret's.
@@ -146,8 +146,9 @@ func readFixtures(path string) (fixtures, error) {
 }
 
 // produce does what a release pipeline does: encrypts every fixture under a fresh pipeline key,
-// writes the values, and wraps the key into the key file - by handing it to the native tool on
-// standard input, or through a network key wrapper in this process.
+// writes the values and the secrets pipeline writer's output, and wraps the key into the key file -
+// by writing it into the native tool's standard input, or through a network key wrapper in this
+// process.
 func produce(wrapperName, service string, f fixtures, dir, cli string) error {
 	pipeline, err := aesgcm256.NewPipelineDataProtector(dek.NewDefaultFormatProvider(), f.KeyVersion)
 	if err != nil {
@@ -166,8 +167,8 @@ func produce(wrapperName, service string, f fixtures, dir, cli string) error {
 	// record anything derived from a DEK beside its key file in a real pipeline.
 	raw := make([]byte, aesgcm256.KeySize)
 	defer hkdfguard.Wipe(raw)
-	if n, err := base64.StdEncoding.Decode(raw, pipeline.KeyBase64()); err != nil || n != aesgcm256.KeySize {
-		return fmt.Errorf("decoding the pipeline key: %d bytes, %v", n, err)
+	if err := readDEKThroughWriteDEK(pipeline, raw); err != nil {
+		return err
 	}
 	digest := sha256.Sum256(raw)
 
@@ -177,12 +178,13 @@ func produce(wrapperName, service string, f fixtures, dir, cli string) error {
 	if err := writeSecretFiles(pipeline, f, filepath.Join(dir, secretsDir)); err != nil {
 		return err
 	}
+	if err := writePipeline(pipeline, f.Pipeline, dir); err != nil {
+		return err
+	}
 	path := filepath.Join(dir, keyFile)
 	if wrapperName == native {
-		wrap := exec.Command(cli, "wrap", "-kf", path, "-sn", service, "--dek-stdin")
-		wrap.Stdin = bytes.NewReader(pipeline.KeyBase64())
-		if output, err := wrap.CombinedOutput(); err != nil {
-			return fmt.Errorf("hkdfguard wrap: %w: %s", err, strings.TrimSpace(string(output)))
+		if err := wrapNatively(cli, path, service, pipeline); err != nil {
+			return err
 		}
 	} else {
 		w, err := newWrapper(wrapperName, service, wrapContext)
@@ -207,7 +209,7 @@ func produce(wrapperName, service string, f fixtures, dir, cli string) error {
 	if err := os.WriteFile(filepath.Join(dir, releaseFile), data, 0o600); err != nil {
 		return err
 	}
-	fmt.Printf("OK produced %d secrets in %s\n", len(values), dir)
+	fmt.Printf("OK produced %d secrets and %d pipeline secrets in %s\n", len(values), len(f.Pipeline.Secrets), dir)
 	return nil
 }
 
@@ -269,6 +271,7 @@ func consume(wrapperName, service string, f fixtures, dir string) error {
 
 	checkCache(c, cache.New(ring), f)
 	checkSecretFiles(c, ring, f, filepath.Join(dir, secretsDir))
+	checkPipeline(c, ring, f.Pipeline, dir)
 	return c.result(fmt.Sprintf("the %s %s release", r.Producer, r.Wrapper))
 }
 
